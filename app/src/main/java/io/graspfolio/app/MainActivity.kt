@@ -139,6 +139,14 @@ private fun PdfReader(uri: Uri, onOpenAnother: () -> Unit, onExit: () -> Unit) {
     ImmersiveReading()
     val context = LocalContext.current
     val annotations = remember(uri) { AnnotationStore.obtain(context, uri) }
+    val readerLifecycle = androidx.lifecycle.compose.LocalLifecycleOwner.current.lifecycle
+    DisposableEffect(annotations, readerLifecycle) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_STOP) annotations.flush()
+        }
+        readerLifecycle.addObserver(observer)
+        onDispose { readerLifecycle.removeObserver(observer); annotations.flush() }
+    }
     var menu by remember(uri) { mutableStateOf(false) }
     var eraser by rememberSaveable { mutableStateOf(false) }
     val penSettings = remember { context.getSharedPreferences("pen_settings", Context.MODE_PRIVATE) }

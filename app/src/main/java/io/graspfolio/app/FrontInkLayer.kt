@@ -25,6 +25,9 @@ internal class FrontInkLayer(context: Context) {
     private val maxAge = AtomicLong(0)
     private val pendingIds = mutableSetOf<String>() // Only UI thread touches this set.
     private var active = false
+    private val frameGate = FrontFrameGate()
+    private var drawnGeneration = 0L
+    private fun requestRender() { if (frameGate.request()) view.renderFrontBufferedLayer() }
     val hasPending get() = pendingIds.isNotEmpty()
     val ready get() = initialized.get() && !closed.get() && view.isAttachedToWindow
     val label get() = if (closed.get()) "前缓冲不可用，已回退" else if (ready) "前缓冲就绪" else "前缓冲初始化中"
@@ -39,12 +42,15 @@ internal class FrontInkLayer(context: Context) {
             override fun onDrawFrontBufferedLayer(canvas: Canvas, width: Int, height: Int) = draw(canvas, width, height)
             override fun onFrontBufferedLayerRenderComplete(frontBufferedLayerSurfaceControl: SurfaceControlCompat, transaction: SurfaceControlCompat.Transaction) {
                 if (!enabled.get() || closed.get()) transaction.setVisibility(frontBufferedLayerSurfaceControl, false)
+                val generation = drawnGeneration
+                view.post { if (!closed.get() && frameGate.complete(generation)) view.renderFrontBufferedLayer() }
             }
         })
     }
     private fun draw(canvas: Canvas, width: Int, height: Int) {
         try {
             val start = System.nanoTime()
+            drawnGeneration = frameGate.generation
             scene.draw(canvas, width, height)
             if (enabled.get()) {
                 frames.incrementAndGet(); cpuNanos.addAndGet(System.nanoTime() - start)
@@ -63,14 +69,14 @@ internal class FrontInkLayer(context: Context) {
     fun append(points: List<InkPoint>, prediction: InkPoint?, eventTime: Long) {
         lastInput.set(eventTime)
         view.execute { scene.append(points, prediction) }
-        view.renderFrontBufferedLayer()
+        requestRender()
     }
     fun finish(id: String) {
         active = false; pendingIds += id
         view.execute { scene.finish(id) }
         // This app hands ink to the parent's cache, not to LowLatencyCanvasView's
         // own HWUI bitmap. Keep the overlay until the parent's frame is submitted.
-        view.renderFrontBufferedLayer()
+        requestRender()
     }
     /** Called after the parent has recorded the finished ink in this HWUI frame. */
     fun handoff(committedIds: Set<String>) {
@@ -78,15 +84,16 @@ internal class FrontInkLayer(context: Context) {
         if (delivered.isEmpty()) return
         pendingIds.removeAll(delivered)
         view.execute { scene.handoff(delivered) }
-        if (!active && pendingIds.isEmpty()) reset() else view.renderFrontBufferedLayer()
+        if (!active && pendingIds.isEmpty()) reset() else requestRender()
     }
     fun cancelActive() {
         if (!active) return
         active = false
         view.execute { scene.cancelActive() }
-        if (pendingIds.isEmpty()) reset() else view.renderFrontBufferedLayer()
+        if (pendingIds.isEmpty()) reset() else requestRender()
     }
     fun reset() {
+        frameGate.reset()
         active = false; pendingIds.clear(); enabled.set(false)
         view.execute { scene.reset() }
         view.cancel(); view.clear()

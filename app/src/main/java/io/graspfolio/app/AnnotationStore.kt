@@ -5,17 +5,16 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
-import android.provider.DocumentsContract as DC
-import android.provider.OpenableColumns
-import android.util.AtomicFile
+import android.util.Log
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.File
-import java.security.MessageDigest
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 internal object InkCodec {
     fun encode(identity: String, strokes: List<InkStroke>): String = JSONObject().put("version", 1).put("document", identity)
@@ -43,8 +42,10 @@ internal object InkCodec {
     }
 }
 
-/** One serial queue per document survives Activity recreation and prevents old writes winning. */
-internal class AnnotationStore private constructor(private val context: Context, private val uri: Uri) {
+
+/** Local durability never waits for the separate SAF worker. All coordination is local-queue-owned. */
+internal class AnnotationStore internal constructor(private val context: Context, private val uri: Uri,
+    private val backend: AnnotationBackend = SafAnnotationBackend(context, uri)) {
     companion object {
         private val stores = mutableMapOf<String, AnnotationStore>()
         @Synchronized fun obtain(context: Context, uri: Uri) = stores.getOrPut(uri.toString()) { AnnotationStore(context.applicationContext, uri) }
@@ -52,121 +53,160 @@ internal class AnnotationStore private constructor(private val context: Context,
     var strokes by mutableStateOf<List<InkStroke>>(emptyList()); private set
     var ready by mutableStateOf(false); private set
     var status by mutableStateOf("正在加载批注…"); private set
-    private val queue = Executors.newSingleThreadExecutor()
+    private val localQueue = Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "InkLocalWriter") }
+    private val remoteQueue = Executors.newSingleThreadExecutor { r -> Thread(r, "InkSidecarSync").apply { priority = Thread.NORM_PRIORITY - 1 } }
     private val main = Handler(Looper.getMainLooper())
     private val prefs = context.getSharedPreferences("annotation_folders", Context.MODE_PRIVATE)
-    private lateinit var identity: String
-    private lateinit var local: AtomicFile
-    private var saved = emptyList<InkStroke>()
-    private var base: String? = null
-    private var dirty = false
-    private var validatedFolder: Uri? = null
-    private var validatedPdfStamp: String? = null
-    private var tree: Uri? = prefs.getString(uri.toString(), null)?.let(Uri::parse)
-    private fun publish(message: String) { main.post { status = message } }
-    private fun digest(bytes: ByteArray) = MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
-    private fun pdfDigest(target: Uri): String {
-        val hash = MessageDigest.getInstance("SHA-256")
-        context.contentResolver.openInputStream(target)!!.use { input ->
-            val buffer = ByteArray(65536)
-            while (true) { val n = input.read(buffer); if (n < 0) break; hash.update(buffer, 0, n) }
-        }
-        return hash.digest().joinToString("") { "%02x".format(it) }
+    private lateinit var journal: AnnotationJournal
+    private var tree = prefs.getString(uri.toString(), null)?.let(Uri::parse)
+    private var timer: ScheduledFuture<*>? = null
+    private var checkpointTimer: ScheduledFuture<*>? = null
+    private var burstStarted = 0L
+    private var inFlight = false
+    private var manualPending = false
+    private var localFailed = false
+    private var uiGeneration = 0L // Main thread only.
+    private var durableGeneration = 0L // Local writer only.
+    private val pendingWrites = AtomicInteger()
+    private fun publish(message: String, generation: Long = durableGeneration) {
+        main.post { if (uiGeneration == generation) status = message }
     }
-    init { queue.execute {
-        try {
-            identity = pdfDigest(uri)
-            val dir = File(context.filesDir, "annotations").apply { mkdirs() }
-            local = AtomicFile(File(dir, digest(uri.toString().toByteArray()) + ".json"))
-            if (local.baseFile.exists() || File(local.baseFile.path + ".bak").exists()) {
-                val root = JSONObject(local.openRead().use { it.readBytes().toString(Charsets.UTF_8) })
-                saved = InkCodec.decode(root.getString("data"), identity)
-                base = root.optString("base").ifEmpty { null }; dirty = root.getBoolean("dirty")
-            }
-            sync()
-            main.post { strokes = saved; ready = true }
-        } catch (e: Exception) { publish("批注加载失败，已禁止书写以保护原数据：${e.message}") }
-    } }
+    init {
+        localQueue.execute {
+            try {
+                journal = InkPerformance.measure("local_recovery") {
+                    backend.openJournal()
+                }
+                manualPending = true
+                startSync()
+            } catch (e: Exception) { publish("批注加载失败，已禁止书写以保护原数据：${e.message}") }
+        }
+    }
     fun replace(value: List<InkStroke>) {
         if (!ready) return
         strokes = value
-        status = "正在保存…"
-        queue.execute {
-            saved = value; dirty = true
-            try { persist(); sync() } catch (e: Exception) { publish("未同步：本地保存失败，请勿退出：${e.message}") }
+        val generation = ++uiGeneration
+        // Keep this label stable across successive strokes; failures remain visible.
+        if (!status.startsWith("未同步")) status = "未同步 · 正在本地保护"
+        val queuedAt = System.nanoTime()
+        val pending = pendingWrites.incrementAndGet()
+        localQueue.execute {
+            try {
+                val waitMs = (System.nanoTime() - queuedAt) / 1_000_000
+                val bytes = InkPerformance.measure("local_delta") { journal.replace(value) }
+                durableGeneration = generation; localFailed = false
+                Log.i("GraspFolioPerf", "local_delta rev=${journal.state.revision} bytes=$bytes queueMs=$waitMs pending=$pending")
+                publish(if (tree == null) "未同步 · 本地已保存，请授权 PDF 所在目录" else "未同步 · 本地已保存，等待旁文件同步")
+                scheduleSync()
+                checkpointTimer?.cancel(false)
+                checkpointTimer = localQueue.schedule({
+                    if (pendingWrites.get() == 0 && !localFailed) runCatching {
+                        InkPerformance.measure("local_checkpoint") { journal.compactIfNeeded() }
+                    }.onFailure { Log.w("GraspFolioPerf", "Local checkpoint deferred", it) }
+                }, 2, TimeUnit.SECONDS)
+            } catch (e: Exception) {
+                localFailed = true
+                publish("未同步：本地保存失败，请勿退出：${e.message}", generation)
+            } finally { pendingWrites.decrementAndGet() }
         }
     }
     fun authorize(folder: Uri) {
         if (!ready) return
         try {
             context.contentResolver.takePersistableUriPermission(folder, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
-            ready = false
-            queue.execute {
-                tree = folder
-                validatedFolder = null
-                prefs.edit().putString(uri.toString(), folder.toString()).commit()
-                sync()
-                val loaded = saved
-                main.post { strokes = loaded; ready = true }
-            }
-        } catch (e: Exception) { publish("未同步：目录授权失败：${e.message}") }
+            requestManual(folder)
+        } catch (e: Exception) { status = "未同步：目录授权失败：${e.message}" }
     }
-    fun retry() {
-        if (!ready) return
+    fun retry() { if (ready) requestManual(null) }
+    private fun requestManual(folder: Uri?) {
+        val latest = strokes
+        val generation = uiGeneration
         ready = false
-        queue.execute {
-            try { persist(); validatedFolder = null; sync() } catch (e: Exception) { publish("未同步：${e.message}") }
-            val loaded = saved
-            main.post { strokes = loaded; ready = true }
+        localQueue.execute {
+            try {
+                // A prior failed delta may still only exist in the displayed state.
+                if (localFailed) {
+                    InkPerformance.measure("local_retry") { journal.replace(latest) }
+                    localFailed = false; durableGeneration = generation
+                }
+                if (folder != null) {
+                    tree = folder
+                    prefs.edit().putString(uri.toString(), folder.toString()).apply()
+                }
+                manualPending = true
+                timer?.cancel(false); timer = null
+                startSync() // If busy, the old result is acknowledged first, then this runs.
+            } catch (e: Exception) {
+                publish("未同步：本地恢复保存失败，请勿退出：${e.message}", generation)
+                main.post { ready = true }
+            }
         }
     }
-    private fun persist() {
-        val bytes = JSONObject().put("data", InkCodec.encode(identity, saved)).put("base", base ?: "").put("dirty", dirty).toString().toByteArray()
-        val stream = local.startWrite()
-        try { stream.write(bytes); local.finishWrite(stream) } catch (e: Exception) { local.failWrite(stream); throw e }
+    /** Exit/background flush requests are asynchronous; the per-edit local records are already queued. */
+    fun flush() { localQueue.execute { timer?.cancel(false); timer = null; if (::journal.isInitialized && journal.state.dirty && !localFailed) startSync() } }
+    private fun scheduleSync() {
+        if (tree == null || localFailed) return
+        val now = System.nanoTime()
+        if (burstStarted == 0L) burstStarted = now
+        if (inFlight) return
+        timer?.cancel(false)
+        val elapsed = TimeUnit.NANOSECONDS.toMillis(now - burstStarted)
+        val delay = minOf(2000L, (5000L - elapsed).coerceAtLeast(0))
+        timer = localQueue.schedule({ timer = null; startSync() }, delay, TimeUnit.MILLISECONDS)
     }
-    private fun sync() {
-        val folder = tree ?: run { publish("未同步 · 本地保护中，请授权 PDF 所在目录"); return }
-        try {
-            val resolver = context.contentResolver
-            val name = resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { if (it.moveToFirst()) it.getString(0) else null } ?: error("无法读取 PDF 文件名")
-            val sideName = name.substringBeforeLast('.', name) + ".graspfolio"
-            val children = DC.buildChildDocumentsUriUsingTree(folder, DC.getTreeDocumentId(folder))
-            val matches = mutableListOf<Pair<String, Uri>>()
-            resolver.query(children, arrayOf(DC.Document.COLUMN_DOCUMENT_ID, DC.Document.COLUMN_DISPLAY_NAME), null, null, null)?.use { c ->
-                while (c.moveToNext()) if (c.getString(1) == name || c.getString(1) == sideName) matches += c.getString(1) to DC.buildDocumentUriUsingTree(folder, c.getString(0))
+    private fun completeManual() {
+        val loaded = journal.state.strokes
+        val generation = durableGeneration
+        main.post { if (uiGeneration == generation) strokes = loaded; ready = true }
+    }
+    private fun startSync() {
+        if (inFlight || localFailed) return
+        val manual = manualPending
+        manualPending = false
+        val folder = tree
+        if (folder == null) {
+            publish("未同步 · 本地已保存，请授权 PDF 所在目录")
+            if (manual) completeManual()
+            return
+        }
+        val snapshot = journal.state
+        inFlight = true; burstStarted = 0
+        // Capture immutable input. Remote work never reads the journal or blocks its executor.
+        remoteQueue.execute {
+            val result = runCatching { InkPerformance.measure("sidecar_total") { backend.sync(folder, snapshot, manual) } }
+            localQueue.execute {
+                inFlight = false
+                result.fold(onSuccess = { output ->
+                    try {
+                        if (output.imported != null) {
+                            require(journal.state.revision == snapshot.revision && !journal.state.dirty) { "本地状态已改变，未载入旁文件" }
+                            journal.importRemote(output.imported, output.hash)
+                        } else {
+                            InkPerformance.measure("local_ack") { journal.acknowledge(snapshot.revision, output.hash) }
+                        }
+                        if (!localFailed) publish(if (journal.state.dirty) "未同步 · 本地已保存，等待旁文件同步" else "已同步到 PDF 旁")
+                        // Compact only occasionally, not once per edit, and never before queued edits.
+                        if (pendingWrites.get() == 0) {
+                            runCatching { InkPerformance.measure("local_checkpoint") { journal.compactIfNeeded() } }
+                                .onFailure { Log.w("GraspFolioPerf", "Local checkpoint deferred", it) }
+                        }
+                    } catch (e: Exception) {
+                        localFailed = true
+                        publish("未同步：同步确认保存失败，请通过菜单重试：${e.message}")
+                    }
+                }, onFailure = { failure ->
+                    if (!localFailed) publish("未同步 · 本地保护中：${failure.message}")
+                })
+                if (manual && !manualPending) completeManual()
+                if (manualPending && localFailed) {
+                    // A disk failure in an older in-flight acknowledgement must not leave
+                    // a subsequently requested authorization/retry permanently disabling input.
+                    manualPending = false
+                    completeManual()
+                } else if (manualPending) startSync()
+                else if (result.isSuccess && journal.state.dirty && !localFailed) scheduleSync()
+                // On failure, retry only after another edit or explicit user action.
             }
-            val pdf = matches.filter { it.first == name }.singleOrNull()?.second ?: error("请选择包含当前 PDF 的目录")
-            val stamp = resolver.query(pdf, arrayOf(DC.Document.COLUMN_LAST_MODIFIED, DC.Document.COLUMN_SIZE), null, null, null)?.use { c ->
-                if (c.moveToFirst() && !c.isNull(0) && !c.isNull(1) && c.getLong(0) > 0) "$pdf:${c.getLong(0)}:${c.getLong(1)}" else null
-            }
-            if (validatedFolder != folder || stamp == null || validatedPdfStamp != stamp) {
-                require(pdfDigest(pdf) == identity) { "所选目录中的同名 PDF 内容不同" }
-                validatedFolder = folder
-                validatedPdfStamp = stamp
-            }
-            val sides = matches.filter { it.first == sideName }; require(sides.size <= 1) { "发现多个同名批注文件" }
-            var side = sides.singleOrNull()?.second
-            val remote = side?.let { resolver.openInputStream(it)!!.use { input -> input.readBytes().toString(Charsets.UTF_8) } }
-            if (remote != null) {
-                val remoteStrokes = InkCodec.decode(remote, identity) // Validate before any overwrite.
-                val hash = digest(remote.toByteArray())
-                if (shouldLoadRemote(base, hash, dirty)) {
-                    require(!ready) { "旁文件已变化，请通过菜单重试同步以载入" }
-                    saved = remoteStrokes; base = hash; persist()
-                    main.post { if (ready) strokes = remoteStrokes }
-                }
-            } else shouldLoadRemote(base, null, dirty)
-            if (dirty || side == null) {
-                val content = InkCodec.encode(identity, saved)
-                // A generic MIME prevents providers from appending '.json' to '.graspfolio'.
-                if (side == null) side = DC.createDocument(resolver, DC.buildDocumentUriUsingTree(folder, DC.getTreeDocumentId(folder)), "application/octet-stream", sideName) ?: error("无法创建旁文件")
-                resolver.openOutputStream(side, "wt")!!.use { it.write(content.toByteArray()) }
-                val verified = resolver.openInputStream(side)!!.use { it.readBytes() }
-                require(digest(verified) == digest(content.toByteArray())) { "旁文件写入校验失败" }
-                base = digest(verified); dirty = false; persist()
-            }
-            publish("已同步到 PDF 旁")
-        } catch (e: Exception) { publish("未同步 · 本地保护中：${e.message}") }
+        }
     }
 }

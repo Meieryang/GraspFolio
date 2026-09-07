@@ -64,7 +64,7 @@ internal class StylusInkView(context: Context) : FrameLayout(context), DefaultLi
         set(value) { if (field != value) { cancelStroke(); resetFront(); field = value; report() } }
     private fun resetFront() { if (Build.VERSION.SDK_INT >= 29) front?.reset() }
     var placements: List<PagePlacement> = emptyList()
-        set(value) { if (field != value) { cancelStroke(); resetFront(); field = value; cachedStrokes = null; invalidate() } }
+        set(value) { if (field != value) { cancelStroke(); resetFront(); field = value; invalidate() } }
     var strokes: List<InkStroke> = emptyList()
         set(value) { if (field !== value) { field = value; invalidate() } }
     var eraser = false
@@ -92,9 +92,9 @@ internal class StylusInkView(context: Context) : FrameLayout(context), DefaultLi
     private val erased = mutableSetOf<String>()
     private val normalizer = PenEventNormalizer()
     private var penDownTime = 0L
-    private val committed = InkRasterCache()
+    private val committed = CommittedInkCache()
+    private val spatial = InkSpatialIndex()
     private val live = InkRasterCache()
-    private var cachedStrokes: List<InkStroke>? = null
     private var liveCount = 0
     private var latestEventTime = 0L
     private var drawCount = 0
@@ -124,7 +124,7 @@ internal class StylusInkView(context: Context) : FrameLayout(context), DefaultLi
         cancelStroke()
         if (Build.VERSION.SDK_INT >= 29) front?.let { it.close(); removeView(it.view) }
         front = null
-        sdk.stop(); committed.release(); live.release(); cachedStrokes = null; owner.lifecycle.removeObserver(this); super.onDetachedFromWindow()
+        sdk.stop(); committed.release(); live.release(); owner.lifecycle.removeObserver(this); super.onDetachedFromWindow()
     }
     override fun onInterceptTouchEvent(event: MotionEvent) = true
     override fun onResume(owner: LifecycleOwner) { foreground = true; sdk.start() }
@@ -136,7 +136,6 @@ internal class StylusInkView(context: Context) : FrameLayout(context), DefaultLi
             val cancel = MotionEvent.obtain(penDownTime, SystemClock.uptimeMillis(), MotionEvent.ACTION_CANCEL, 0f, 0f, 0)
             try { sdk.predict(cancel) } finally { cancel.recycle() }
         }
-        if (erased.isNotEmpty()) cachedStrokes = null
         active = null; pointer = -1; points.clear(); erased.clear(); predicted = null
         live.clear(); liveCount = 0
         sdk.vibrate(false); onContact(false); invalidate()
@@ -152,6 +151,7 @@ internal class StylusInkView(context: Context) : FrameLayout(context), DefaultLi
             active = placement; pointer = event.getPointerId(actionIndex); penDownTime = event.eventTime
             drawCount = 0; drawNanos = 0; maxEventAge = 0; predictionAttempts = 0; acceptedPredictions = 0
             erasing = eraser || event.getToolType(actionIndex) == MotionEvent.TOOL_TYPE_ERASER || event.buttonState and MotionEvent.BUTTON_STYLUS_PRIMARY != 0
+            if (erasing) InkPerformance.measure("erase_index") { spatial.sync(strokes) }
             frontStroke = Build.VERSION.SDK_INT >= 29 && frontBufferEnabled && !erasing && front?.ready == true
             if (Build.VERSION.SDK_INT >= 29 && frontStroke) { live.release(); front?.begin(placement) }
             onContact(true); sdk.vibrate(writingVibration && !erasing)
@@ -173,8 +173,11 @@ internal class StylusInkView(context: Context) : FrameLayout(context), DefaultLi
                 val previous = points.lastOrNull() ?: p
                 // A stroke may leave the page, but cannot erase anything on another page.
                 clipToPage(previous, p, placement.width, placement.height)?.let { (from, to) ->
-                    for (stroke in strokes) if (stroke.page == placement.page && stroke.id !in erased && strokeHit(stroke, from, to, 12f * resources.displayMetrics.density / placement.scale)) {
-                        erased += stroke.id; cachedStrokes = null
+                    val radius = 12f * resources.displayMetrics.density / placement.scale
+                    InkPerformance.measure("erase_hit") {
+                    for (stroke in spatial.candidates(placement.page, from, to, radius)) if (stroke.id !in erased && strokeHit(stroke, from, to, radius)) {
+                        erased += stroke.id
+                    }
                     }
                 }
             }
@@ -213,7 +216,9 @@ internal class StylusInkView(context: Context) : FrameLayout(context), DefaultLi
             pointer = -1 // UP already reset SDK state; do not send an extra CANCEL.
             cancelStroke(); report()
         }
-        invalidate(); return true
+        // Live front-buffer moves do not change the parent's committed bitmap.
+        if (!frontStroke || up) invalidate()
+        return true
     }
     private fun commit(value: List<InkStroke>) {
         strokes = value // A second stroke may begin before Compose's next frame.
@@ -222,17 +227,7 @@ internal class StylusInkView(context: Context) : FrameLayout(context), DefaultLi
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         val begin = System.nanoTime()
-        if (committed.resize(width, height)) cachedStrokes = null
-        val old = cachedStrokes
-        if (old !== strokes) {
-            val append = old != null && erased.isEmpty() && strokes.size >= old.size && old.indices.all { old[it] === strokes[it] }
-            if (!append) committed.clear()
-            for (i in (if (append) old!!.size else 0) until strokes.size) {
-                val stroke = strokes[i]
-                if (stroke.id !in erased) placements.firstOrNull { it.page == stroke.page }?.let { committed.stroke(it, stroke) }
-            }
-            cachedStrokes = strokes
-        }
+        committed.update(width, height, placements, strokes, erased, spatial)
         committed.show(canvas)
         if (Build.VERSION.SDK_INT >= 29) {
             val layer = front

@@ -10,6 +10,8 @@ import android.graphics.Rect
 internal class InkRasterCache {
     private var bitmap: Bitmap? = null
     private var target: Canvas? = null
+    private var repairBitmap: Bitmap? = null
+    private val replacePixels = Paint().apply { xfermode = android.graphics.PorterDuffXfermode(android.graphics.PorterDuff.Mode.SRC) }
     private val destination = Rect()
     private val blit = Paint()
     private val pen = Paint(Paint.ANTI_ALIAS_FLAG).apply { strokeCap = Paint.Cap.ROUND }
@@ -18,11 +20,29 @@ internal class InkRasterCache {
         if (width <= 0 || height <= 0) return false
         if (destination.width() == width && destination.height() == height && bitmap != null) return false
         bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        repairBitmap = null
         target = Canvas(bitmap!!); destination.set(0, 0, width, height); generation++
         return true
     }
     fun clear() { bitmap?.eraseColor(Color.TRANSPARENT) }
-    fun release() { target = null; bitmap = null; destination.setEmpty() }
+    fun repair(region: Rect, coverage: Rect, draw: () -> Unit) {
+        val original = target ?: return
+        var scratch = repairBitmap
+        if (scratch == null) {
+            scratch = Bitmap.createBitmap(destination.width(), destination.height(), Bitmap.Config.ARGB_8888)
+            repairBitmap = scratch
+        }
+        val canvas = Canvas(scratch)
+        // Keep the same device-space origin and clip as the full cache: software stroke
+        // rasterization can otherwise round antialiased edge coverage differently.
+        canvas.save(); canvas.clipRect(coverage)
+        canvas.drawColor(Color.TRANSPARENT, android.graphics.PorterDuff.Mode.CLEAR)
+        canvas.restore()
+        target = canvas
+        try { draw() } finally { target = original }
+        original.drawBitmap(scratch, region, region, replacePixels)
+    }
+    fun release() { target = null; bitmap = null; repairBitmap = null; destination.setEmpty() }
     fun show(canvas: Canvas) { bitmap?.let { canvas.drawBitmap(it, null, destination, blit) } }
     fun stroke(page: PagePlacement, stroke: InkStroke) {
         val points = stroke.points

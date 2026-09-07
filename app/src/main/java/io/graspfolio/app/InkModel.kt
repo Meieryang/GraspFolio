@@ -35,7 +35,8 @@ private fun distance(p: InkPoint, a: InkPoint, b: InkPoint): Float {
 fun strokeHit(stroke: InkStroke, a: InkPoint, b: InkPoint, radius: Float): Boolean {
     val reach = radius + stroke.width * .75f
     if (stroke.points.any { distance(it, a, b) <= reach }) return true
-    return stroke.points.zipWithNext().any { (c, d) ->
+    for (i in 1 until stroke.points.size) {
+        val c = stroke.points[i - 1]; val d = stroke.points[i]
         val dx = b.x - a.x; val dy = b.y - a.y
         val ex = d.x - c.x; val ey = d.y - c.y
         val cross = dx * ey - dy * ex
@@ -44,6 +45,7 @@ fun strokeHit(stroke: InkStroke, a: InkPoint, b: InkPoint, radius: Float): Boole
             val u = ((c.x - a.x) * dy - (c.y - a.y) * dx) / cross
             t in 0f..1f && u in 0f..1f
         }
-        intersects || distance(a, c, d) <= reach || distance(b, c, d) <= reach
+        if (intersects || distance(a, c, d) <= reach || distance(b, c, d) <= reach) return true
     }
+    return false
 }
