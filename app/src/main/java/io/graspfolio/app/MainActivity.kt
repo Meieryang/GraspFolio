@@ -1,7 +1,11 @@
 package io.graspfolio.app
 
 import android.content.Context
+import android.content.Intent
+import android.content.res.Configuration
 import android.graphics.Bitmap
+import android.graphics.Matrix
+import android.graphics.Rect as AndroidRect
 import android.graphics.pdf.PdfRenderer
 import android.net.Uri
 import android.os.Build
@@ -11,6 +15,7 @@ import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -28,6 +33,14 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.displayCutout
+import androidx.compose.foundation.layout.captionBar
+import androidx.compose.foundation.layout.union
+import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.layout.safeDrawingPadding
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -41,6 +54,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -58,11 +72,18 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import io.graspfolio.app.ui.theme.GraspFolioTheme
 import kotlin.math.roundToInt
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.CancellationException
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -78,17 +99,23 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 private fun GraspFolioApp(initialUri: Uri?) {
-    var documentUri by remember { mutableStateOf(initialUri) }
+    val context = LocalContext.current
+    var documentPath by rememberSaveable { mutableStateOf(initialUri?.toString()) }
     val openPdf = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        uri?.let { documentUri = it }
+        uri?.let {
+            try { context.contentResolver.takePersistableUriPermission(it, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
+            catch (_: SecurityException) { /* Some providers only grant temporary access. */ }
+            documentPath = it.toString()
+        }
     }
-    if (documentUri == null) WelcomeScreen { openPdf.launch(arrayOf("application/pdf")) }
-    else PdfReader(documentUri!!, onOpenAnother = { openPdf.launch(arrayOf("application/pdf")) })
+    BackHandler(enabled = documentPath != null) { documentPath = null }
+    if (documentPath == null) WelcomeScreen { openPdf.launch(arrayOf("application/pdf")) }
+    else PdfReader(Uri.parse(documentPath!!), onOpenAnother = { openPdf.launch(arrayOf("application/pdf")) })
 }
 
 @Composable
 private fun WelcomeScreen(onOpen: () -> Unit) = Box(
-    Modifier.fillMaxSize().background(Paper), contentAlignment = Alignment.Center
+    Modifier.fillMaxSize().background(Paper).safeDrawingPadding(), contentAlignment = Alignment.Center
 ) {
     Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(32.dp)) {
         Text("GraspFolio", style = MaterialTheme.typography.displaySmall, fontWeight = FontWeight.SemiBold, color = Ink)
@@ -106,40 +133,56 @@ private fun WelcomeScreen(onOpen: () -> Unit) = Box(
 
 @Composable
 private fun PdfReader(uri: Uri, onOpenAnother: () -> Unit) {
+    ImmersiveReading()
     val context = LocalContext.current
+    val progressStore = remember(context) { ReadingProgressStore(context) }
+    val savedProgress = remember(uri) { progressStore.load(uri.toString()) }
+    val spread = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
+    var cover by remember(uri) { mutableStateOf(savedProgress.cover) }
     var document by remember(uri) { mutableStateOf<PdfDocument?>(null) }
     var error by remember(uri) { mutableStateOf<String?>(null) }
-    var page by remember(uri) { mutableIntStateOf(0) }
+    var page by remember(uri) { mutableIntStateOf(savedProgress.page) }
     var bitmap by remember(uri) { mutableStateOf<Bitmap?>(null) }
     var renderWidth by remember { mutableIntStateOf(0) }
     var holdPosition by remember { mutableStateOf<Offset?>(null) }
     var holdOrigin by remember { mutableStateOf<Offset?>(null) }
     var holdDirection by remember { mutableStateOf(0) }
-    LaunchedEffect(uri) { runCatching { PdfDocument(context, uri) }.onSuccess { document = it }.onFailure { error = "无法打开这个 PDF：${it.message ?: "文件可能已损坏或不可访问"}" } }
+    LaunchedEffect(uri) { runCatching { PdfDocument(context, uri) }.onSuccess { page = page.coerceIn(0, it.pageCount - 1); document = it }.onFailure { error = "无法打开这个 PDF：${it.message ?: "文件可能已损坏或不可访问"}" } }
     DisposableEffect(document) {
         // Capture this composition's instance. Reading the mutable state from onDispose would
         // otherwise close the newly opened document while disposing the initial null effect.
         val documentToClose = document
         onDispose { documentToClose?.close() }
     }
-    LaunchedEffect(document, page, renderWidth) {
+    LaunchedEffect(document, page, renderWidth, spread, cover) {
         document?.takeIf { renderWidth > 0 }?.let { active ->
-            bitmap = runCatching { active.render(page, renderWidth) }.getOrElse { error = "页面渲染失败：${it.message ?: "未知错误"}"; null }
+            val pages = readingPages(page, active.pageCount, spread, cover)
+            try {
+                bitmap = withContext(Dispatchers.Default) { active.render(pages, renderWidth) }
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (failure: Exception) { error = "页面渲染失败：${failure.message ?: "未知错误"}" }
         }
     }
-    val navigate: (Int) -> Unit = { direction -> page = (page + direction).coerceIn(0, ((document?.pageCount ?: 1) - 1).coerceAtLeast(0)) }
-    Box(Modifier.fillMaxSize().background(Paper)) {
+    val navigate: (Int) -> Unit = { direction ->
+        document?.let { active ->
+            page = turnPage(page, active.pageCount, spread, cover, direction)
+            progressStore.save(uri.toString(), ReadingProgress(page, cover))
+        }
+    }
+    // Hidden system bars occupy no layout space. Only physical cutouts and a system-owned
+    // desktop caption (if present) reduce the usable area; page fit and corner input share it.
+    Box(Modifier.fillMaxSize().background(Paper).windowInsetsPadding(WindowInsets.displayCutout.union(WindowInsets.captionBar))) {
         when {
             error != null -> ErrorScreen(error!!, onOpenAnother)
             document == null -> LoadingScreen()
             else -> BoxWithConstraints(
-                Modifier.fillMaxSize().padding(top = 28.dp, bottom = 20.dp), contentAlignment = Alignment.Center
+                Modifier.fillMaxSize(), contentAlignment = Alignment.Center
             ) {
                 val density = LocalDensity.current
                 val viewport = with(density) { Size(maxWidth.toPx(), maxHeight.toPx()) }
                 val pageBounds = bitmap?.let { fittedPageBounds(viewport, Size(it.width.toFloat(), it.height.toFloat())) } ?: Rect.Zero
                 Box(Modifier.fillMaxSize().cornerNavigationInput(
-                    documentKey = document!!,
+                    documentKey = Pair(document!!, spread),
                     pageBounds = pageBounds,
                     onNavigate = navigate,
                     onContinuousStart = { position, direction -> holdOrigin = position; holdPosition = position; holdDirection = direction; vibrate(context) },
@@ -151,7 +194,20 @@ private fun PdfReader(uri: Uri, onOpenAnother: () -> Unit) {
                     LaunchedEffect(targetWidth) { renderWidth = targetWidth }
                     bitmap?.let { Image(it.asImageBitmap(), "PDF 第 ${page + 1} 页", Modifier.fillMaxSize(), contentScale = ContentScale.Fit) }
                 }
-                PageNumber(page + 1, document!!.pageCount, Modifier.align(Alignment.BottomCenter))
+                val label = readingPages(page, document!!.pageCount, spread, cover).filterNotNull().joinToString("–") { (it + 1).toString() }
+                PageNumber(label, document!!.pageCount, Modifier.align(Alignment.BottomCenter))
+                if (spread) {
+                    Button(
+                        onClick = { cover = !cover; progressStore.save(uri.toString(), ReadingProgress(page, cover)) },
+                        modifier = Modifier.align(Alignment.TopCenter).size(48.dp).semantics {
+                            contentDescription = "封面单独显示"
+                            stateDescription = if (cover) "已开启" else "已关闭"
+                        },
+                        shape = CircleShape,
+                        contentPadding = PaddingValues(0.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = if (cover) Ink.copy(alpha = .75f) else Color.White.copy(alpha = .75f), contentColor = if (cover) Color.White else Ink)
+                    ) { Text("封") }
+                }
                 holdOrigin?.let { origin ->
                     ContinuousTurnIndicator(origin, holdPosition ?: origin, holdDirection)
                 }
@@ -234,7 +290,7 @@ private suspend fun PointerInputScope.cornerNavigation(pageBounds: () -> Rect, o
 }
 
 @Composable
-private fun PageNumber(page: Int, pageCount: Int, modifier: Modifier = Modifier) = Text("$page / $pageCount", color = MutedInk, style = MaterialTheme.typography.labelMedium, modifier = modifier.clip(RoundedCornerShape(16.dp)).background(Color.White.copy(alpha = .72f)).padding(horizontal = 10.dp, vertical = 5.dp))
+private fun PageNumber(page: String, pageCount: Int, modifier: Modifier = Modifier) = Text("$page / $pageCount", color = MutedInk, style = MaterialTheme.typography.labelMedium, modifier = modifier.clip(RoundedCornerShape(16.dp)).background(Color.White.copy(alpha = .72f)).padding(horizontal = 10.dp, vertical = 5.dp))
 
 @Composable
 private fun ContinuousTurnIndicator(origin: Offset, position: Offset, direction: Int) = Canvas(Modifier.fillMaxSize()) {
@@ -263,12 +319,36 @@ private fun vibrate(context: Context) {
 
 private class PdfDocument(context: Context, uri: Uri) : AutoCloseable {
     private val descriptor: ParcelFileDescriptor = context.contentResolver.openFileDescriptor(uri, "r") ?: error("无法读取文件")
-    private val renderer = PdfRenderer(descriptor)
-    val pageCount get() = renderer.pageCount
-    fun render(index: Int, targetWidth: Int): Bitmap = renderer.openPage(index).use { page ->
-        val height = (page.height * (targetWidth.toFloat() / page.width)).roundToInt().coerceAtLeast(1)
-        Bitmap.createBitmap(targetWidth, height, Bitmap.Config.ARGB_8888).also { page.render(it, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY) }
+    private val renderer = try { PdfRenderer(descriptor) } catch (failure: Exception) { descriptor.close(); throw failure }
+    val pageCount = renderer.pageCount
+    init { if (pageCount == 0) { renderer.close(); error("PDF 没有页面") } }
+    @Synchronized
+    fun render(indices: List<Int?>, targetWidth: Int): Bitmap {
+        val dimensions = indices.map { index -> index?.let { renderer.openPage(it).use { p -> Size(p.width.toFloat(), p.height.toFloat()) } } }
+        val fallback = dimensions.first { it != null }!!
+        val sizes = dimensions.map { it ?: fallback }
+        val totalWidth = sizes.sumOf { it.width.toDouble() }.toFloat()
+        val totalHeight = sizes.maxOf { it.height }
+        // Cap either dimension and total pixels so continuous spreads have bounded memory.
+        val scale = minOf(targetWidth.coerceAtMost(4096) / totalWidth, 4096f / totalHeight,
+            kotlin.math.sqrt(6_000_000f / (totalWidth * totalHeight)))
+        val bitmap = Bitmap.createBitmap((totalWidth * scale).roundToInt().coerceAtLeast(1), (totalHeight * scale).roundToInt().coerceAtLeast(1), Bitmap.Config.ARGB_8888)
+        bitmap.eraseColor(android.graphics.Color.WHITE)
+        var x = 0f
+        try {
+            indices.forEachIndexed { slot, index ->
+                val width = sizes[slot].width * scale
+                if (index != null) renderer.openPage(index).use { p ->
+                    val matrix = Matrix().apply { setScale(scale, scale); postTranslate(x, 0f) }
+                    val clip = AndroidRect(x.roundToInt(), 0, (x + width).roundToInt().coerceAtMost(bitmap.width), (sizes[slot].height * scale).roundToInt().coerceAtMost(bitmap.height))
+                    if (clip.width() > 0 && clip.height() > 0) p.render(bitmap, clip, matrix, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                }
+                x += width
+            }
+            return bitmap
+        } catch (failure: Exception) { bitmap.recycle(); throw failure }
     }
+    @Synchronized
     override fun close() { renderer.close(); descriptor.close() }
 }
 
