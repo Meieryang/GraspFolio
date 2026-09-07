@@ -3,7 +3,6 @@ package io.graspfolio.app
 import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.PorterDuff
-import android.graphics.RectF
 
 /** Owned exclusively by the front-buffer worker. No UI-thread collections cross into it. */
 internal class FrontInkScene {
@@ -11,51 +10,39 @@ internal class FrontInkScene {
     private val finished = mutableListOf<Trace>()
     private var active: Trace? = null
     private var prediction: InkPoint? = null
-    private val dirty = RectF()
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xff111111.toInt(); strokeCap = Paint.Cap.ROUND }
     val pendingCount get() = finished.size
-    private fun bounds(page: PagePlacement, a: InkPoint, b: InkPoint = a): RectF {
-        val pad = 2f * page.scale + 2f
-        return RectF(page.left + minOf(a.x, b.x) * page.scale - pad, page.top + minOf(a.y, b.y) * page.scale - pad,
-            page.left + maxOf(a.x, b.x) * page.scale + pad, page.top + maxOf(a.y, b.y) * page.scale + pad)
-    }
-    private fun mark(trace: Trace) { for (i in trace.points.indices) dirty.union(bounds(trace.page, trace.points[i], trace.points[maxOf(0, i - 1)])) }
-    private fun markPrediction() { active?.let { trace -> prediction?.let { p -> trace.points.lastOrNull()?.let { dirty.union(bounds(trace.page, it, p)) } } } }
     fun begin(page: PagePlacement) { cancelActive(); active = Trace(page, mutableListOf()) }
     fun append(points: List<InkPoint>, nextPrediction: InkPoint?) {
         val trace = active ?: return
-        markPrediction()
-        for (point in points) {
-            dirty.union(bounds(trace.page, trace.points.lastOrNull() ?: point, point))
-            trace.points += point
-        }
-        prediction = nextPrediction; markPrediction()
+        trace.points.addAll(points)
+        prediction = nextPrediction
     }
     fun finish(id: String) {
-        markPrediction(); prediction = null
+        prediction = null
         active?.let { it.id = id; finished += it }; active = null
     }
     fun handoff(ids: Set<String>) {
-        val iterator = finished.iterator()
-        while (iterator.hasNext()) { val trace = iterator.next(); if (trace.id in ids) { mark(trace); iterator.remove() } }
+        finished.removeAll { it.id in ids }
     }
-    fun cancelActive() { active?.let(::mark); markPrediction(); active = null; prediction = null }
-    fun reset() { finished.clear(); active = null; prediction = null; dirty.setEmpty() }
-    fun draw(canvas: Canvas, width: Int, height: Int, full: Boolean = false) {
-        val region = if (full) RectF(0f, 0f, width.toFloat(), height.toFloat()) else RectF(dirty)
-        if (region.isEmpty) return
-        canvas.save(); canvas.clipRect(region); canvas.drawColor(0, PorterDuff.Mode.CLEAR)
-        for (trace in finished) drawTrace(canvas, trace, region)
+    fun cancelActive() { active = null; prediction = null }
+    fun reset() { finished.clear(); active = null; prediction = null }
+    fun draw(canvas: Canvas, width: Int, height: Int) {
+        // Each callback records a complete display list. Do not depend on pixels surviving
+        // a previous hardware-buffer submission (including callbacks without new samples).
+        // Only transient ink is replayed here, never the PDF or the saved annotation layer.
+        canvas.save(); canvas.clipRect(0, 0, width, height); canvas.drawColor(0, PorterDuff.Mode.CLEAR)
+        for (trace in finished) drawTrace(canvas, trace)
         active?.let { trace ->
-            drawTrace(canvas, trace, region)
+            drawTrace(canvas, trace)
             prediction?.let { end -> trace.points.lastOrNull()?.let { segment(canvas, trace.page, it, end) } }
         }
-        canvas.restore(); dirty.setEmpty()
+        canvas.restore()
     }
-    private fun drawTrace(canvas: Canvas, trace: Trace, region: RectF) {
+    private fun drawTrace(canvas: Canvas, trace: Trace) {
         for (i in trace.points.indices) {
             val point = trace.points[i]; val previous = trace.points[maxOf(0, i - 1)]
-            if (RectF.intersects(region, bounds(trace.page, previous, point))) segment(canvas, trace.page, if (i == 0) null else previous, point)
+            segment(canvas, trace.page, if (i == 0) null else previous, point)
         }
     }
     private fun segment(canvas: Canvas, page: PagePlacement, from: InkPoint?, to: InkPoint) {

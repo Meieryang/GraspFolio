@@ -33,19 +33,19 @@ internal class FrontInkLayer(context: Context) {
         view.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
         view.setRenderCallback(object : LowLatencyCanvasView.Callback {
             override fun onRedrawRequested(canvas: Canvas, width: Int, height: Int) {
-                draw(canvas, width, height, true)
+                draw(canvas, width, height)
                 if (!closed.get()) { initialized.set(true); Log.i("GraspFolioPen", "Front buffer surface ready ${width}x$height") }
             }
-            override fun onDrawFrontBufferedLayer(canvas: Canvas, width: Int, height: Int) = draw(canvas, width, height, false)
+            override fun onDrawFrontBufferedLayer(canvas: Canvas, width: Int, height: Int) = draw(canvas, width, height)
             override fun onFrontBufferedLayerRenderComplete(frontBufferedLayerSurfaceControl: SurfaceControlCompat, transaction: SurfaceControlCompat.Transaction) {
                 if (!enabled.get() || closed.get()) transaction.setVisibility(frontBufferedLayerSurfaceControl, false)
             }
         })
     }
-    private fun draw(canvas: Canvas, width: Int, height: Int, full: Boolean) {
+    private fun draw(canvas: Canvas, width: Int, height: Int) {
         try {
             val start = System.nanoTime()
-            scene.draw(canvas, width, height, full)
+            scene.draw(canvas, width, height)
             if (enabled.get()) {
                 frames.incrementAndGet(); cpuNanos.addAndGet(System.nanoTime() - start)
                 maxAge.accumulateAndGet((SystemClock.uptimeMillis() - lastInput.get()).coerceAtLeast(0), ::maxOf)

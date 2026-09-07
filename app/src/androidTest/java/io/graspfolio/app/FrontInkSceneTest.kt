@@ -8,6 +8,27 @@ import org.junit.Test
 class FrontInkSceneTest {
     private val page = PagePlacement(0, 10f, 10f, 80f, 80f, 1f)
     private fun point(x: Float, y: Float = 40f) = InkPoint(x, y, 1f, 1)
+    @Test fun freshFramesKeepEntireActiveStrokeEvenWithoutNewSamples() {
+        val scene = FrontInkScene()
+        val bitmap = Bitmap.createBitmap(100, 100, Bitmap.Config.ARGB_8888)
+        try {
+            val canvas = Canvas(bitmap)
+            scene.begin(page); scene.append(listOf(point(10f), point(30f)), null)
+            scene.draw(canvas, 100, 100)
+            scene.append(listOf(point(60f)), point(70f))
+            // Simulate a new recording target, rather than relying on software bitmap retention.
+            bitmap.eraseColor(0); scene.draw(canvas, 100, 100)
+            assertNotEquals("The beginning must remain visible before UP", 0, bitmap.getPixel(25, 50))
+            assertNotEquals(0, bitmap.getPixel(65, 50))
+            bitmap.eraseColor(0); scene.draw(canvas, 100, 100)
+            assertNotEquals("An extra callback must not lose the scene", 0, bitmap.getPixel(25, 50))
+            scene.finish("a"); scene.begin(page); scene.append(listOf(point(20f, 65f)), null)
+            bitmap.eraseColor(0); scene.draw(canvas, 100, 100)
+            assertNotEquals("Pending handoff remains visible", 0, bitmap.getPixel(25, 50))
+            assertNotEquals(0, bitmap.getPixel(30, 75))
+            assertEquals("Prediction is never part of finished ink", 0, bitmap.getPixel(78, 50))
+        } finally { bitmap.recycle() }
+    }
     @Test fun replacingPredictionRemovesOldTailButPreservesRealInk() {
         val scene = FrontInkScene()
         val bitmap = Bitmap.createBitmap(100, 100, Bitmap.Config.ARGB_8888)
@@ -47,10 +68,10 @@ class FrontInkSceneTest {
         try {
             val canvas = Canvas(bitmap)
             scene.begin(page); scene.append(listOf(point(-20f), point(100f)), null)
-            scene.draw(canvas, 100, 100, true)
+            scene.draw(canvas, 100, 100)
             assertEquals(0, bitmap.getPixel(5, 50)); assertEquals(0, bitmap.getPixel(95, 50))
             assertNotEquals(0, bitmap.getPixel(50, 50))
-            scene.reset(); scene.draw(canvas, 100, 100, true)
+            scene.reset(); scene.draw(canvas, 100, 100)
             assertEquals(0, bitmap.getPixel(50, 50))
         } finally { bitmap.recycle() }
     }
