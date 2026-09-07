@@ -1,0 +1,3 @@
+-keep class com.vivo.trackpredictor.** { *; }
+-keep class com.vivo.bluetoothpen.** { *; }
+-keep class com.vivo.penengine.impl.** { *; }

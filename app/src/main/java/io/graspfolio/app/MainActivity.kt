@@ -23,6 +23,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Box
@@ -67,6 +69,8 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.PointerInputScope
+import androidx.compose.ui.input.pointer.PointerType
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.input.pointer.changedToUpIgnoreConsumed
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
@@ -108,9 +112,8 @@ private fun GraspFolioApp(initialUri: Uri?) {
             documentPath = it.toString()
         }
     }
-    BackHandler(enabled = documentPath != null) { documentPath = null }
     if (documentPath == null) WelcomeScreen { openPdf.launch(arrayOf("application/pdf")) }
-    else PdfReader(Uri.parse(documentPath!!), onOpenAnother = { openPdf.launch(arrayOf("application/pdf")) })
+    else PdfReader(Uri.parse(documentPath!!), onOpenAnother = { openPdf.launch(arrayOf("application/pdf")) }, onExit = { documentPath = null })
 }
 
 @Composable
@@ -132,9 +135,20 @@ private fun WelcomeScreen(onOpen: () -> Unit) = Box(
 }
 
 @Composable
-private fun PdfReader(uri: Uri, onOpenAnother: () -> Unit) {
+private fun PdfReader(uri: Uri, onOpenAnother: () -> Unit, onExit: () -> Unit) {
     ImmersiveReading()
     val context = LocalContext.current
+    val annotations = remember(uri) { AnnotationStore.obtain(context, uri) }
+    var menu by remember(uri) { mutableStateOf(false) }
+    var eraser by rememberSaveable { mutableStateOf(false) }
+    val penSettings = remember { context.getSharedPreferences("pen_settings", Context.MODE_PRIVATE) }
+    var writingVibration by rememberSaveable { mutableStateOf(penSettings.getBoolean("writing_vibration", true)) }
+    var predictionEnabled by rememberSaveable { mutableStateOf(penSettings.getBoolean("prediction", true)) }
+    var frontBufferEnabled by rememberSaveable { mutableStateOf(penSettings.getBoolean("front_buffer", true)) }
+    var penDiagnostics by remember { mutableStateOf("写几笔后显示 SDK 状态和绘制耗时") }
+    var penContact by remember { mutableStateOf(false) }
+    BackHandler { menu = !menu }
+    val folderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { it?.let(annotations::authorize) }
     val progressStore = remember(context) { ReadingProgressStore(context) }
     val savedProgress = remember(uri) { progressStore.load(uri.toString()) }
     val spread = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
@@ -142,7 +156,8 @@ private fun PdfReader(uri: Uri, onOpenAnother: () -> Unit) {
     var document by remember(uri) { mutableStateOf<PdfDocument?>(null) }
     var error by remember(uri) { mutableStateOf<String?>(null) }
     var page by remember(uri) { mutableIntStateOf(savedProgress.page) }
-    var bitmap by remember(uri) { mutableStateOf<Bitmap?>(null) }
+    var rendered by remember(uri) { mutableStateOf<RenderedPages?>(null) }
+    val bitmap = rendered?.bitmap
     var renderWidth by remember { mutableIntStateOf(0) }
     var holdPosition by remember { mutableStateOf<Offset?>(null) }
     var holdOrigin by remember { mutableStateOf<Offset?>(null) }
@@ -158,7 +173,7 @@ private fun PdfReader(uri: Uri, onOpenAnother: () -> Unit) {
         document?.takeIf { renderWidth > 0 }?.let { active ->
             val pages = readingPages(page, active.pageCount, spread, cover)
             try {
-                bitmap = withContext(Dispatchers.Default) { active.render(pages, renderWidth) }
+                rendered = withContext(Dispatchers.Default) { active.render(pages, renderWidth) }
             } catch (cancelled: CancellationException) { throw cancelled }
             catch (failure: Exception) { error = "页面渲染失败：${failure.message ?: "未知错误"}" }
         }
@@ -181,9 +196,17 @@ private fun PdfReader(uri: Uri, onOpenAnother: () -> Unit) {
                 val density = LocalDensity.current
                 val viewport = with(density) { Size(maxWidth.toPx(), maxHeight.toPx()) }
                 val pageBounds = bitmap?.let { fittedPageBounds(viewport, Size(it.width.toFloat(), it.height.toFloat())) } ?: Rect.Zero
+                val currentPages = readingPages(page, document!!.pageCount, spread, cover)
+                val renderReady = rendered?.indices == currentPages
+                val inkPages = rendered?.let { result ->
+                    val fit = pageBounds.width / result.bitmap.width
+                    result.placements.map { p -> p.copy(left = pageBounds.left + p.left * fit, top = pageBounds.top + p.top * fit, scale = p.scale * fit) }
+                } ?: emptyList()
                 Box(Modifier.fillMaxSize().cornerNavigationInput(
-                    documentKey = Pair(document!!, spread),
+                    documentKey = Triple(Pair(document!!, spread), penContact, menu),
+                    enabled = !penContact && !menu,
                     pageBounds = pageBounds,
+                    physicalBounds = inkPages.map { Rect(it.left, it.top, it.left + it.width * it.scale, it.top + it.height * it.scale) },
                     onNavigate = navigate,
                     onContinuousStart = { position, direction -> holdOrigin = position; holdPosition = position; holdDirection = direction; vibrate(context) },
                     onContinuousMove = { holdPosition = it },
@@ -194,6 +217,23 @@ private fun PdfReader(uri: Uri, onOpenAnother: () -> Unit) {
                     LaunchedEffect(targetWidth) { renderWidth = targetWidth }
                     bitmap?.let { Image(it.asImageBitmap(), "PDF 第 ${page + 1} 页", Modifier.fillMaxSize(), contentScale = ContentScale.Fit) }
                 }
+                AndroidView(
+                    factory = { StylusInkView(it) },
+                    modifier = Modifier.fillMaxSize(),
+                    update = { view ->
+                        view.placements = inkPages
+                        view.strokes = annotations.strokes
+                        view.eraser = eraser
+                        view.writingVibration = writingVibration
+                        view.onDiagnostics = { penDiagnostics = it }
+                        view.predictionEnabled = predictionEnabled
+                        view.frontBufferEnabled = frontBufferEnabled
+                        view.enabledForWriting = annotations.ready && renderReady && !menu
+                        view.onChange = annotations::replace
+                        view.onContact = { penContact = it }
+                        view.onToggle = { eraser = !eraser }
+                    }
+                )
                 val label = readingPages(page, document!!.pageCount, spread, cover).filterNotNull().joinToString("–") { (it + 1).toString() }
                 PageNumber(label, document!!.pageCount, Modifier.align(Alignment.BottomCenter))
                 if (spread) {
@@ -211,8 +251,26 @@ private fun PdfReader(uri: Uri, onOpenAnother: () -> Unit) {
                 holdOrigin?.let { origin ->
                     ContinuousTurnIndicator(origin, holdPosition ?: origin, holdDirection)
                 }
+                if (!annotations.status.startsWith("已同步")) Text(annotations.status, color = Ink,
+                    modifier = Modifier.align(Alignment.BottomStart).background(Color.White.copy(alpha = .8f)).padding(6.dp),
+                    style = MaterialTheme.typography.labelSmall)
                 }
             }
+        }
+        if (menu) Column(Modifier.align(Alignment.Center).clip(RoundedCornerShape(24.dp))
+            .background(Color.White.copy(alpha = .92f)).verticalScroll(rememberScrollState()).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+            Text("阅读工具", color = Ink)
+            Button(onClick = { eraser = false }) { Text(if (!eraser) "✓ 压感笔" else "压感笔") }
+            Button(onClick = { eraser = true }) { Text(if (eraser) "✓ 整笔橡皮" else "整笔橡皮") }
+            Button(onClick = { writingVibration = !writingVibration; penSettings.edit().putBoolean("writing_vibration", writingVibration).apply() }) { Text("书写振动：" + if (writingVibration) "开启" else "关闭") }
+            Button(onClick = { predictionEnabled = !predictionEnabled; penSettings.edit().putBoolean("prediction", predictionEnabled).apply() }) { Text("笔迹预测：" + if (predictionEnabled) "开启" else "关闭（对比）") }
+            Button(onClick = { frontBufferEnabled = !frontBufferEnabled; penSettings.edit().putBoolean("front_buffer", frontBufferEnabled).apply() }) { Text("低延迟前缓冲：" + if (frontBufferEnabled) "开启" else "关闭（对比）") }
+            Text(penDiagnostics, color = Ink, style = MaterialTheme.typography.labelSmall)
+            Text(annotations.status, color = Ink)
+            Button(onClick = { folderPicker.launch(null) }) { Text("授权 PDF 所在目录") }
+            Button(onClick = annotations::retry) { Text("重试同步") }
+            Button(onClick = { menu = false }) { Text("返回沉浸阅读") }
+            Button(onClick = onExit) { Text("退出阅读") }
         }
     }
 }
@@ -220,7 +278,9 @@ private fun PdfReader(uri: Uri, onOpenAnother: () -> Unit) {
 @Composable
 internal fun Modifier.cornerNavigationInput(
     documentKey: Any,
+    enabled: Boolean = true,
     pageBounds: Rect? = null,
+    physicalBounds: List<Rect> = emptyList(),
     onNavigate: (Int) -> Unit,
     onContinuousStart: (Offset, Int) -> Unit,
     onContinuousMove: (Offset) -> Unit,
@@ -232,8 +292,10 @@ internal fun Modifier.cornerNavigationInput(
     val move by rememberUpdatedState(onContinuousMove)
     val end by rememberUpdatedState(onContinuousEnd)
     val bounds by rememberUpdatedState(pageBounds)
-    return pointerInput(documentKey) {
-        cornerNavigation({ bounds ?: Rect(0f, 0f, size.width.toFloat(), size.height.toFloat()) }, { navigate(it) }, { position, direction -> start(position, direction) }, { move(it) }, { end() })
+    val physical by rememberUpdatedState(physicalBounds)
+    return pointerInput(documentKey, enabled) {
+        if (!enabled) return@pointerInput
+        cornerNavigation({ physical.ifEmpty { listOf(bounds ?: Rect(0f, 0f, size.width.toFloat(), size.height.toFloat())) } }, { navigate(it) }, { position, direction -> start(position, direction) }, { move(it) }, { end() })
     }
 }
 
@@ -262,16 +324,24 @@ internal fun cornerDirection(position: Offset, bounds: Rect, corner: Float): Int
 private fun controlLength(origin: Offset, height: Float, density: Float): Float =
     minOf(260f * density, (height - origin.y - 16f * density).coerceAtLeast(1f))
 
-private suspend fun PointerInputScope.cornerNavigation(pageBounds: () -> Rect, onNavigate: (Int) -> Unit, onContinuousStart: (Offset, Int) -> Unit, onContinuousMove: (Offset) -> Unit, onContinuousEnd: () -> Unit) {
+private suspend fun PointerInputScope.cornerNavigation(pageBounds: () -> List<Rect>, onNavigate: (Int) -> Unit, onContinuousStart: (Offset, Int) -> Unit, onContinuousMove: (Offset) -> Unit, onContinuousEnd: () -> Unit) {
     awaitEachGesture {
         val down = awaitFirstDown(requireUnconsumed = false)
+        if (down.type != PointerType.Touch) return@awaitEachGesture
         val corner = 92f * density
-        val direction = cornerDirection(down.position, pageBounds(), corner)
+        val direction = pageBounds().firstNotNullOfOrNull { cornerDirection(down.position, it, corner).takeIf { value -> value != 0 } } ?: 0
         if (direction == 0) return@awaitEachGesture
         var position = down.position
         val released = withTimeoutOrNull(600L) {
-            while (true) { val change = awaitPointerEvent().changes.firstOrNull { it.id == down.id } ?: continue; position = change.position; if (change.changedToUpIgnoreConsumed()) return@withTimeoutOrNull true }
+            while (true) {
+                val event = awaitPointerEvent()
+                if (event.changes.any { it.pressed && it.type != PointerType.Touch }) return@withTimeoutOrNull false
+                val change = event.changes.firstOrNull { it.id == down.id } ?: continue
+                position = change.position
+                if (change.changedToUpIgnoreConsumed()) return@withTimeoutOrNull true
+            }
         }
+        if (released == false) return@awaitEachGesture
         if (released == true) { onNavigate(direction); return@awaitEachGesture }
         val origin = position
         val travel = controlLength(origin, size.height.toFloat(), density)
@@ -281,9 +351,15 @@ private suspend fun PointerInputScope.cornerNavigation(pageBounds: () -> Rect, o
             while (pressed) {
                 val progress = ((position.y - origin.y) / travel).coerceIn(0f, 1f)
                 val releasedDuringTurn = withTimeoutOrNull((600f - progress * 480f).toLong()) {
-                    while (true) { val change = awaitPointerEvent().changes.firstOrNull { it.id == down.id } ?: continue; position = change.position; onContinuousMove(position); if (change.changedToUpIgnoreConsumed()) return@withTimeoutOrNull true }
+                    while (true) {
+                        val event = awaitPointerEvent()
+                        if (event.changes.any { it.pressed && it.type != PointerType.Touch }) return@withTimeoutOrNull false
+                        val change = event.changes.firstOrNull { it.id == down.id } ?: continue
+                        position = change.position; onContinuousMove(position)
+                        if (change.changedToUpIgnoreConsumed()) return@withTimeoutOrNull true
+                    }
                 }
-                if (releasedDuringTurn == true) pressed = false else onNavigate(direction)
+                if (releasedDuringTurn != null) pressed = false else onNavigate(direction)
             }
         } finally { onContinuousEnd() }
     }
@@ -317,13 +393,15 @@ private fun vibrate(context: Context) {
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) vibrator.vibrate(VibrationEffect.createOneShot(25, VibrationEffect.DEFAULT_AMPLITUDE)) else @Suppress("DEPRECATION") vibrator.vibrate(25)
 }
 
+private data class RenderedPages(val bitmap: Bitmap, val placements: List<PagePlacement>, val indices: List<Int?>)
+
 private class PdfDocument(context: Context, uri: Uri) : AutoCloseable {
     private val descriptor: ParcelFileDescriptor = context.contentResolver.openFileDescriptor(uri, "r") ?: error("无法读取文件")
     private val renderer = try { PdfRenderer(descriptor) } catch (failure: Exception) { descriptor.close(); throw failure }
     val pageCount = renderer.pageCount
     init { if (pageCount == 0) { renderer.close(); error("PDF 没有页面") } }
     @Synchronized
-    fun render(indices: List<Int?>, targetWidth: Int): Bitmap {
+    fun render(indices: List<Int?>, targetWidth: Int): RenderedPages {
         val dimensions = indices.map { index -> index?.let { renderer.openPage(it).use { p -> Size(p.width.toFloat(), p.height.toFloat()) } } }
         val fallback = dimensions.first { it != null }!!
         val sizes = dimensions.map { it ?: fallback }
@@ -335,17 +413,19 @@ private class PdfDocument(context: Context, uri: Uri) : AutoCloseable {
         val bitmap = Bitmap.createBitmap((totalWidth * scale).roundToInt().coerceAtLeast(1), (totalHeight * scale).roundToInt().coerceAtLeast(1), Bitmap.Config.ARGB_8888)
         bitmap.eraseColor(android.graphics.Color.WHITE)
         var x = 0f
+        val placements = mutableListOf<PagePlacement>()
         try {
             indices.forEachIndexed { slot, index ->
                 val width = sizes[slot].width * scale
                 if (index != null) renderer.openPage(index).use { p ->
+                    placements += PagePlacement(index, x, 0f, p.width.toFloat(), p.height.toFloat(), scale)
                     val matrix = Matrix().apply { setScale(scale, scale); postTranslate(x, 0f) }
                     val clip = AndroidRect(x.roundToInt(), 0, (x + width).roundToInt().coerceAtMost(bitmap.width), (sizes[slot].height * scale).roundToInt().coerceAtMost(bitmap.height))
                     if (clip.width() > 0 && clip.height() > 0) p.render(bitmap, clip, matrix, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
                 }
                 x += width
             }
-            return bitmap
+            return RenderedPages(bitmap, placements, indices)
         } catch (failure: Exception) { bitmap.recycle(); throw failure }
     }
     @Synchronized

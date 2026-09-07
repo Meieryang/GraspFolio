@@ -2,6 +2,8 @@ package io.graspfolio.app
 
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -39,7 +41,10 @@ class CornerNavigationTest {
                 onContinuousStart = { _, _ -> startCount++; continuous = true },
                 onContinuousMove = {},
                 onContinuousEnd = { continuous = false }
-            ))
+            )) {
+                // Exercise the native ink overlay accepting the same finger stream.
+                AndroidView(factory = { StylusInkView(it) }, modifier = Modifier.fillMaxSize())
+            }
         }
         compose.onNodeWithTag("reader").performTouchInput {
             down(Offset(if (direction > 0) width - 10f else 10f, 10f))

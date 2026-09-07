@@ -3,6 +3,11 @@
     xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- SDK 1.0.0.10 no longer requests QUERY_ALL_PACKAGES; keep visibility scoped. -->
+    <queries>
+        <package android:name="com.vivo.penalgoengine" />
+        <package android:name="com.vivo.penwrite" />
+    </queries>
 
     <application
         android:allowBackup="true"
