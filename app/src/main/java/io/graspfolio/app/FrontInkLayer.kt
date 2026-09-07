@@ -68,7 +68,9 @@ internal class FrontInkLayer(context: Context) {
     fun finish(id: String) {
         active = false; pendingIds += id
         view.execute { scene.finish(id) }
-        view.renderFrontBufferedLayer(); view.commit()
+        // This app hands ink to the parent's cache, not to LowLatencyCanvasView's
+        // own HWUI bitmap. Keep the overlay until the parent's frame is submitted.
+        view.renderFrontBufferedLayer()
     }
     /** Called after the parent has recorded the finished ink in this HWUI frame. */
     fun handoff(committedIds: Set<String>) {
@@ -82,7 +84,7 @@ internal class FrontInkLayer(context: Context) {
         if (!active) return
         active = false
         view.execute { scene.cancelActive() }
-        if (pendingIds.isEmpty()) reset() else { view.renderFrontBufferedLayer(); view.commit() }
+        if (pendingIds.isEmpty()) reset() else view.renderFrontBufferedLayer()
     }
     fun reset() {
         active = false; pendingIds.clear(); enabled.set(false)

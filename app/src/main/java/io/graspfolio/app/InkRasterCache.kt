@@ -5,22 +5,19 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Rect
-import kotlin.math.sqrt
 
-/** Display-only, bounded to 16 MB per layer; vector data remains the source of truth. */
+/** Display-only, one pixel per viewport pixel; vector data remains the source of truth. */
 internal class InkRasterCache {
     private var bitmap: Bitmap? = null
     private var target: Canvas? = null
-    private var scale = 1f
     private val destination = Rect()
-    private val blit = Paint(Paint.FILTER_BITMAP_FLAG)
+    private val blit = Paint()
     private val pen = Paint(Paint.ANTI_ALIAS_FLAG).apply { strokeCap = Paint.Cap.ROUND }
     var generation = 0; private set
     fun resize(width: Int, height: Int): Boolean {
         if (width <= 0 || height <= 0) return false
         if (destination.width() == width && destination.height() == height && bitmap != null) return false
-        scale = minOf(1f, sqrt(4_000_000f / (width.toFloat() * height)))
-        bitmap = Bitmap.createBitmap((width * scale).toInt().coerceAtLeast(1), (height * scale).toInt().coerceAtLeast(1), Bitmap.Config.ARGB_8888)
+        bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         target = Canvas(bitmap!!); destination.set(0, 0, width, height); generation++
         return true
     }
@@ -35,7 +32,7 @@ internal class InkRasterCache {
     }
     fun segment(page: PagePlacement, from: InkPoint?, to: InkPoint, color: Int, width: Float) {
         val canvas = target ?: return
-        canvas.save(); canvas.scale(scale, scale)
+        canvas.save()
         canvas.clipRect(page.left, page.top, page.left + page.width * page.scale, page.top + page.height * page.scale)
         canvas.translate(page.left, page.top); canvas.scale(page.scale, page.scale)
         pen.color = color

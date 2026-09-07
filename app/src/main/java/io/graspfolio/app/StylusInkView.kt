@@ -153,7 +153,7 @@ internal class StylusInkView(context: Context) : FrameLayout(context), DefaultLi
             drawCount = 0; drawNanos = 0; maxEventAge = 0; predictionAttempts = 0; acceptedPredictions = 0
             erasing = eraser || event.getToolType(actionIndex) == MotionEvent.TOOL_TYPE_ERASER || event.buttonState and MotionEvent.BUTTON_STYLUS_PRIMARY != 0
             frontStroke = Build.VERSION.SDK_INT >= 29 && frontBufferEnabled && !erasing && front?.ready == true
-            if (Build.VERSION.SDK_INT >= 29 && frontStroke) front?.begin(placement)
+            if (Build.VERSION.SDK_INT >= 29 && frontStroke) { live.release(); front?.begin(placement) }
             onContact(true); sdk.vibrate(writingVibration && !erasing)
         }
         // Accept the finger's initial DOWN too: a pen may join this same native event stream.
@@ -223,7 +223,6 @@ internal class StylusInkView(context: Context) : FrameLayout(context), DefaultLi
         super.onDraw(canvas)
         val begin = System.nanoTime()
         if (committed.resize(width, height)) cachedStrokes = null
-        if (live.resize(width, height)) liveCount = 0
         val old = cachedStrokes
         if (old !== strokes) {
             val append = old != null && erased.isEmpty() && strokes.size >= old.size && old.indices.all { old[it] === strokes[it] }
@@ -244,6 +243,7 @@ internal class StylusInkView(context: Context) : FrameLayout(context), DefaultLi
             if (frontStroke && layer?.ready != true) frontStroke = false
         }
         active?.takeIf { !erasing && !frontStroke }?.let { p ->
+            if (live.resize(width, height)) liveCount = 0
             for (i in liveCount until points.size) live.segment(p, if (i == 0) null else points[i - 1], points[i], 0xff111111.toInt(), 2f)
             liveCount = points.size
             live.show(canvas)
