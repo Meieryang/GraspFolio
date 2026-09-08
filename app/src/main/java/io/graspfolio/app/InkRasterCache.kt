@@ -47,18 +47,32 @@ internal class InkRasterCache {
     fun stroke(page: PagePlacement, stroke: InkStroke) {
         val points = stroke.points
         if (points.isEmpty()) return
-        segment(page, null, points[0], stroke.color, stroke.width)
-        for (i in 1 until points.size) segment(page, points[i - 1], points[i], stroke.color, stroke.width)
+        val canvas = target ?: return
+        val style = stroke.style
+        // A marker must not allocate a full-page temporary layer for every short stroke.
+        val checkpoint = if (style.alpha < 255) {
+            val bounds = inkBounds(stroke)
+            val left = maxOf(page.left, page.left + bounds.left * page.scale - 2)
+            val top = maxOf(page.top, page.top + bounds.top * page.scale - 2)
+            val right = minOf(page.left + page.width * page.scale, page.left + bounds.right * page.scale + 2)
+            val bottom = minOf(page.top + page.height * page.scale, page.top + bounds.bottom * page.scale + 2)
+            if (left >= right || top >= bottom) return
+            canvas.saveLayerAlpha(left, top, right, bottom, style.alpha)
+        } else canvas.save()
+        segment(page, null, points[0], style.opaqueColor, style.width, style.brush)
+        for (i in 1 until points.size) segment(page, points[i - 1], points[i], style.opaqueColor, style.width, style.brush)
+        canvas.restoreToCount(checkpoint)
     }
-    fun segment(page: PagePlacement, from: InkPoint?, to: InkPoint, color: Int, width: Float) {
+    fun segment(page: PagePlacement, from: InkPoint?, to: InkPoint, color: Int, width: Float, brush: String = "pressure") {
         val canvas = target ?: return
         canvas.save()
         canvas.clipRect(page.left, page.top, page.left + page.width * page.scale, page.top + page.height * page.scale)
         canvas.translate(page.left, page.top); canvas.scale(page.scale, page.scale)
         pen.color = color
-        if (from == null) canvas.drawCircle(to.x, to.y, pressureWidth(width, to.pressure) / 2, pen)
+        fun lineWidth(pressure: Float) = if (brush == "pressure") pressureWidth(width, pressure) else width
+        if (from == null) canvas.drawCircle(to.x, to.y, lineWidth(to.pressure) / 2, pen)
         else {
-            pen.strokeWidth = pressureWidth(width, (from.pressure + to.pressure) / 2)
+            pen.strokeWidth = lineWidth((from.pressure + to.pressure) / 2)
             canvas.drawLine(from.x, from.y, to.x, to.y, pen)
         }
         canvas.restore()

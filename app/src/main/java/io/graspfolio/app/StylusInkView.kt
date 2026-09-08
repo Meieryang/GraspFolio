@@ -68,6 +68,8 @@ internal class StylusInkView(context: Context) : FrameLayout(context), DefaultLi
     var strokes: List<InkStroke> = emptyList()
         set(value) { if (field !== value) { field = value; invalidate() } }
     var eraser = false
+    var brushStyle = BrushStyle()
+    private var activeStyle = BrushStyle()
     var writingVibration = true
     var predictionEnabled = true
         set(value) { if (field != value) { cancelStroke(); field = value; report() } }
@@ -149,11 +151,14 @@ internal class StylusInkView(context: Context) : FrameLayout(context), DefaultLi
             if (!enabledForWriting) return true
             val placement = placements.firstOrNull { it.contains(event.getX(actionIndex), event.getY(actionIndex)) } ?: return true
             active = placement; pointer = event.getPointerId(actionIndex); penDownTime = event.eventTime
+            activeStyle = brushStyle
             drawCount = 0; drawNanos = 0; maxEventAge = 0; predictionAttempts = 0; acceptedPredictions = 0
             erasing = eraser || event.getToolType(actionIndex) == MotionEvent.TOOL_TYPE_ERASER || event.buttonState and MotionEvent.BUTTON_STYLUS_PRIMARY != 0
             if (erasing) InkPerformance.measure("erase_index") { spatial.sync(strokes) }
-            frontStroke = Build.VERSION.SDK_INT >= 29 && frontBufferEnabled && !erasing && front?.ready == true
-            if (Build.VERSION.SDK_INT >= 29 && frontStroke) { live.release(); front?.begin(placement) }
+            // Translucent ink uses the single-composition cache path: overlapping pending
+            // front and committed surfaces would briefly double its opacity on handoff.
+            frontStroke = Build.VERSION.SDK_INT >= 29 && frontBufferEnabled && !erasing && activeStyle.alpha == 255 && front?.ready == true
+            if (Build.VERSION.SDK_INT >= 29 && frontStroke) { live.release(); front?.begin(placement, activeStyle) }
             onContact(true); sdk.vibrate(writingVibration && !erasing)
         }
         // Accept the finger's initial DOWN too: a pen may join this same native event stream.
@@ -206,7 +211,7 @@ internal class StylusInkView(context: Context) : FrameLayout(context), DefaultLi
         if (up) {
             if (erasing) { if (erased.isNotEmpty()) commit(strokes.filterNot { it.id in erased }) }
             else if (points.isNotEmpty()) {
-                val stroke = InkStroke(UUID.randomUUID().toString(), placement.page, points.toList())
+                val stroke = InkStroke(UUID.randomUUID().toString(), placement.page, points.toList(), activeStyle.color, activeStyle.width, activeStyle.brush)
                 if (Build.VERSION.SDK_INT >= 29 && frontStroke) front?.finish(stroke.id)
                 commit(strokes + stroke)
             }
@@ -239,16 +244,19 @@ internal class StylusInkView(context: Context) : FrameLayout(context), DefaultLi
         }
         active?.takeIf { !erasing && !frontStroke }?.let { p ->
             if (live.resize(width, height)) liveCount = 0
-            for (i in liveCount until points.size) live.segment(p, if (i == 0) null else points[i - 1], points[i], 0xff111111.toInt(), 2f)
+            for (i in liveCount until points.size) live.segment(p, if (i == 0) null else points[i - 1], points[i], activeStyle.opaqueColor, activeStyle.width, activeStyle.brush)
             liveCount = points.size
+            val opacityLayer = if (activeStyle.alpha < 255) canvas.saveLayerAlpha(p.left, p.top,
+                p.left + p.width * p.scale, p.top + p.height * p.scale, activeStyle.alpha) else canvas.save()
             live.show(canvas)
             canvas.save(); canvas.clipRect(p.left, p.top, p.left + p.width * p.scale, p.top + p.height * p.scale)
             canvas.translate(p.left, p.top); canvas.scale(p.scale, p.scale)
             predicted?.let { tail -> points.lastOrNull()?.let { last ->
-                paint.color = 0xff111111.toInt(); paint.strokeWidth = pressureWidth(2f, last.pressure)
+                paint.color = activeStyle.opaqueColor; paint.strokeWidth = activeStyle.widthAt((last.pressure + tail.pressure) / 2)
                 canvas.drawLine(last.x, last.y, tail.x, tail.y, paint)
             } }
             canvas.restore()
+            canvas.restoreToCount(opacityLayer)
         }
         if (active != null) {
             drawCount++; drawNanos += System.nanoTime() - begin

@@ -34,7 +34,7 @@ internal object InkCodec {
                 }
             }
             InkStroke(s.getString("id"), s.getInt("page"), points, s.getInt("color"), s.getDouble("width").toFloat(), s.getString("brush")).also {
-                require(it.page >= 0 && it.points.isNotEmpty() && it.width.isFinite() && it.width > 0 && it.brush == "pressure")
+                require(it.page >= 0 && it.points.isNotEmpty() && it.width.isFinite() && it.width > 0 && it.brush in BrushStyle.types)
             }
         }
         require(result.map { it.id }.distinct().size == result.size)

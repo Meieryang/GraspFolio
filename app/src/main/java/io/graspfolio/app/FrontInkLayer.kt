@@ -62,9 +62,9 @@ internal class FrontInkLayer(context: Context) {
             view.post { view.cancel(); view.clear(); (view.parent as? View)?.invalidate() }
         }
     }
-    fun begin(page: PagePlacement) {
+    fun begin(page: PagePlacement, style: BrushStyle = BrushStyle()) {
         active = true; enabled.set(true); frames.set(0); cpuNanos.set(0); maxAge.set(0)
-        view.execute { scene.begin(page) }
+        view.execute { scene.begin(page, style) }
     }
     fun append(points: List<InkPoint>, prediction: InkPoint?, eventTime: Long) {
         lastInput.set(eventTime)

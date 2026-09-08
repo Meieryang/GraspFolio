@@ -23,8 +23,6 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Box
@@ -42,7 +40,6 @@ import androidx.compose.foundation.layout.captionBar
 import androidx.compose.foundation.layout.union
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.safeDrawingPadding
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -77,9 +74,6 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalConfiguration
-import androidx.compose.ui.semantics.contentDescription
-import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -147,9 +141,11 @@ private fun PdfReader(uri: Uri, onOpenAnother: () -> Unit, onExit: () -> Unit) {
         readerLifecycle.addObserver(observer)
         onDispose { readerLifecycle.removeObserver(observer); annotations.flush() }
     }
-    var menu by remember(uri) { mutableStateOf(false) }
+    var menu by rememberSaveable(uri.toString()) { mutableStateOf(false) }
     var eraser by rememberSaveable { mutableStateOf(false) }
     val penSettings = remember { context.getSharedPreferences("pen_settings", Context.MODE_PRIVATE) }
+    var brushStyle by remember { mutableStateOf(penSettings.loadBrush()) }
+    val selectStyle: (BrushStyle) -> Unit = { brushStyle = it; penSettings.saveBrush(it) }
     var writingVibration by rememberSaveable { mutableStateOf(penSettings.getBoolean("writing_vibration", true)) }
     var predictionEnabled by rememberSaveable { mutableStateOf(penSettings.getBoolean("prediction", true)) }
     var frontBufferEnabled by rememberSaveable { mutableStateOf(penSettings.getBoolean("front_buffer", true)) }
@@ -232,6 +228,7 @@ private fun PdfReader(uri: Uri, onOpenAnother: () -> Unit, onExit: () -> Unit) {
                         view.placements = inkPages
                         view.strokes = annotations.strokes
                         view.eraser = eraser
+                        view.brushStyle = brushStyle
                         view.writingVibration = writingVibration
                         view.onDiagnostics = { penDiagnostics = it }
                         view.predictionEnabled = predictionEnabled
@@ -243,43 +240,27 @@ private fun PdfReader(uri: Uri, onOpenAnother: () -> Unit, onExit: () -> Unit) {
                     }
                 )
                 val label = readingPages(page, document!!.pageCount, spread, cover).filterNotNull().joinToString("–") { (it + 1).toString() }
-                PageNumber(label, document!!.pageCount, Modifier.align(Alignment.BottomCenter))
-                if (spread) {
-                    Button(
-                        onClick = { cover = !cover; progressStore.save(uri.toString(), ReadingProgress(page, cover)) },
-                        modifier = Modifier.align(Alignment.TopCenter).size(48.dp).semantics {
-                            contentDescription = "封面单独显示"
-                            stateDescription = if (cover) "已开启" else "已关闭"
-                        },
-                        shape = CircleShape,
-                        contentPadding = PaddingValues(0.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = if (cover) Ink.copy(alpha = .75f) else Color.White.copy(alpha = .75f), contentColor = if (cover) Color.White else Ink)
-                    ) { Text("封") }
-                }
+                if (!menu) PageNumber(label, document!!.pageCount, Modifier.align(Alignment.BottomCenter))
                 holdOrigin?.let { origin ->
                     ContinuousTurnIndicator(origin, holdPosition ?: origin, holdDirection)
                 }
-                if (!annotations.status.startsWith("已同步")) Text(annotations.status, color = Ink,
+                if (!menu && !annotations.status.startsWith("已同步")) Text(annotations.status, color = Ink,
                     modifier = Modifier.align(Alignment.BottomStart).background(Color.White.copy(alpha = .8f)).padding(6.dp),
                     style = MaterialTheme.typography.labelSmall)
                 }
             }
         }
-        if (menu) Column(Modifier.align(Alignment.Center).clip(RoundedCornerShape(24.dp))
-            .background(Color.White.copy(alpha = .92f)).verticalScroll(rememberScrollState()).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-            Text("阅读工具", color = Ink)
-            Button(onClick = { eraser = false }) { Text(if (!eraser) "✓ 压感笔" else "压感笔") }
-            Button(onClick = { eraser = true }) { Text(if (eraser) "✓ 整笔橡皮" else "整笔橡皮") }
-            Button(onClick = { writingVibration = !writingVibration; penSettings.edit().putBoolean("writing_vibration", writingVibration).apply() }) { Text("书写振动：" + if (writingVibration) "开启" else "关闭") }
-            Button(onClick = { predictionEnabled = !predictionEnabled; penSettings.edit().putBoolean("prediction", predictionEnabled).apply() }) { Text("笔迹预测：" + if (predictionEnabled) "开启" else "关闭（对比）") }
-            Button(onClick = { frontBufferEnabled = !frontBufferEnabled; penSettings.edit().putBoolean("front_buffer", frontBufferEnabled).apply() }) { Text("低延迟前缓冲：" + if (frontBufferEnabled) "开启" else "关闭（对比）") }
-            Text(penDiagnostics, color = Ink, style = MaterialTheme.typography.labelSmall)
-            Text(annotations.status, color = Ink)
-            Button(onClick = { folderPicker.launch(null) }) { Text("授权 PDF 所在目录") }
-            Button(onClick = annotations::retry) { Text("重试同步") }
-            Button(onClick = { menu = false }) { Text("返回沉浸阅读") }
-            Button(onClick = onExit) { Text("退出阅读") }
-        }
+        if (menu) ReaderTools(
+            style = brushStyle, eraser = eraser, onStyle = selectStyle,
+            onBrush = { selectStyle(penSettings.loadBrush(it)) }, onEraser = { eraser = it }, onClose = { menu = false },
+            page = page, pageCount = document?.pageCount ?: 0,
+            onPage = { target -> document?.let { doc -> page = readingPages(target, doc.pageCount, spread, cover).filterNotNull().first(); progressStore.save(uri.toString(), ReadingProgress(page, cover)) } },
+            spread = spread, cover = cover, onCover = { cover = !cover; progressStore.save(uri.toString(), ReadingProgress(page, cover)) },
+            writingVibration = writingVibration, onVibration = { writingVibration = !writingVibration; penSettings.edit().putBoolean("writing_vibration", writingVibration).apply() },
+            prediction = predictionEnabled, onPrediction = { predictionEnabled = !predictionEnabled; penSettings.edit().putBoolean("prediction", predictionEnabled).apply() },
+            frontBuffer = frontBufferEnabled, onFrontBuffer = { frontBufferEnabled = !frontBufferEnabled; penSettings.edit().putBoolean("front_buffer", frontBufferEnabled).apply() },
+            diagnostics = penDiagnostics, saveStatus = annotations.status, onAuthorize = { folderPicker.launch(null) }, onRetry = annotations::retry, onExit = onExit
+        )
     }
 }
 
