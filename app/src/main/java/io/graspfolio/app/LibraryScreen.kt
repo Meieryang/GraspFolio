@@ -71,9 +71,9 @@ internal fun LibraryScreen(onOpen: () -> Unit, onRead: (Uri) -> Unit) {
                 Text("GraspFolio 掌页", color = GlassInk, fontWeight = FontWeight.SemiBold)
                 Text("握住书页，自在阅读。", color = GlassMuted, fontSize = 12.sp)
                 Spacer(Modifier.height(20.dp))
-                GlassAction("图书库", { settings = false }, Modifier.fillMaxWidth())
+                GlassAction("图书库", { settings = false }, Modifier.fillMaxWidth(), selected = !settings)
                 GlassAction("打开 PDF", onOpen, Modifier.fillMaxWidth())
-                GlassAction("设置", { settings = true }, Modifier.fillMaxWidth())
+                GlassAction("设置", { settings = true }, Modifier.fillMaxWidth(), selected = settings)
             }
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(18.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -151,7 +151,7 @@ private fun BookCard(book: LibraryBook, onClick: () -> Unit) {
         pageCount = result?.second ?: 0; value = result?.first
     }
     val progress = remember(book.uri) { ReadingProgressStore(context).load(book.uri.toString()) }
-    Column(Modifier.fillMaxWidth().liquidGlass(26, .15f).clickable(role = Role.Button, onClick = onClick).padding(16.dp),
+    Column(Modifier.fillMaxWidth().liquidGlass(26, .15f).glassClickable(onClick = onClick).padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Box(Modifier.fillMaxWidth().aspectRatio(.76f).shadow(8.dp, RoundedCornerShape(8.dp)).clip(RoundedCornerShape(8.dp))
             .background(Color(0xfffffcf7)), contentAlignment = Alignment.Center) {

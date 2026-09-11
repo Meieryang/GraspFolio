@@ -2,6 +2,15 @@ package io.graspfolio.app
 
 import android.os.Build
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.PressInteraction
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.graphics.drawscope.clipRect
+import androidx.compose.ui.graphics.drawscope.Stroke
+import com.kyant.backdrop.highlight.HighlightStyle
 import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.animation.core.animateDpAsState
@@ -64,24 +73,25 @@ internal fun Modifier.liquidGlass(radius: Int = 28, tintAlpha: Float = .24f): Mo
     val shape = RoundedCornerShape(radius.dp)
     val source = LocalGlassBackdrop.current
     val solid = LocalSolidGlass.current
-    val alpha = if (solid || Build.VERSION.SDK_INT < 31) .88f else tintAlpha
+    val alpha = if (solid || Build.VERSION.SDK_INT < 31) .88f else tintAlpha * .55f
     val base = if (source == null) background(Color.White.copy(alpha = .86f), shape) else drawBackdrop(
         backdrop = source,
         shape = { shape },
         effects = {
             if (!solid) {
                 vibrancy()
-                blur(3.dp.toPx())
-                lens(minOf(10.dp.toPx(), size.minDimension / 3), minOf(16.dp.toPx(), size.minDimension / 2), chromaticAberration = true)
+                blur(1.5.dp.toPx())
+                lens(minOf(14.dp.toPx(), size.minDimension / 3), minOf(24.dp.toPx(), size.minDimension * .65f), depthEffect = true, chromaticAberration = true)
             }
         },
-        highlight = { Highlight(width = 1.dp, alpha = .8f) },
-        shadow = { Shadow(radius = 12.dp, color = Color(0xff514638).copy(alpha = .16f)) },
+        highlight = { Highlight(width = .8.dp, blurRadius = .4.dp, alpha = .9f,
+            style = HighlightStyle.Default(color = Color.White.copy(alpha = .72f), angle = 40f, falloff = 1.8f)) },
+        shadow = { Shadow(radius = 10.dp, color = Color(0xff344652).copy(alpha = .12f)) },
         onDrawSurface = {
-            drawRect(Brush.verticalGradient(listOf(Color.White.copy(alpha = alpha + (1f - alpha) * .22f), Color.White.copy(alpha = alpha))))
+            drawRect(Brush.verticalGradient(listOf(Color.White.copy(alpha = alpha + (1f - alpha) * .07f), Color.White.copy(alpha = alpha))))
         }
     )
-    return base.border(.7.dp, Brush.linearGradient(listOf(Color.White.copy(alpha = .95f), Color.White.copy(alpha = .12f), Color.White.copy(alpha = .8f))), shape).clip(shape)
+    return base.border(.5.dp, Brush.linearGradient(listOf(Color.White.copy(alpha = .68f), GlassInk.copy(alpha = .10f), Color.White.copy(alpha = .48f))), shape).clip(shape)
 }
 
 @Composable
@@ -105,8 +115,8 @@ internal fun LeatherBackground(modifier: Modifier = Modifier) {
 }
 
 @Composable
-internal fun GlassAction(label: String, onClick: () -> Unit, modifier: Modifier = Modifier) {
-    Box(modifier.liquidGlass(24).clickable(role = Role.Button, onClick = onClick)
+internal fun GlassAction(label: String, onClick: () -> Unit, modifier: Modifier = Modifier, selected: Boolean = false) {
+    Box(modifier.liquidGlass(24).glassClickable(selected = selected, onClick = onClick)
         .padding(horizontal = 22.dp, vertical = 14.dp), contentAlignment = Alignment.Center) {
         Text(label, color = GlassInk)
     }
@@ -114,14 +124,53 @@ internal fun GlassAction(label: String, onClick: () -> Unit, modifier: Modifier 
 
 @Composable
 internal fun GlassToggle(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+    val interaction = remember { MutableInteractionSource() }
     val offset by animateDpAsState(if (checked) 20.dp else 0.dp, label = "glass switch")
     Box(Modifier.size(56.dp, 48.dp).semantics { contentDescription = label }
-        .toggleable(checked, role = Role.Switch, onValueChange = onChange), contentAlignment = Alignment.Center) {
-        Box(Modifier.size(52.dp, 32.dp).liquidGlass(16, if (checked) .16f else .48f)
+        .toggleable(checked, interactionSource = interaction, indication = null, role = Role.Switch, onValueChange = onChange), contentAlignment = Alignment.Center) {
+        Box(Modifier.size(52.dp, 32.dp).liquidGlass(16, if (checked) .16f else .48f).glassFeedback(interaction, checked)
             .background(if (checked) GlassInk.copy(alpha = .18f) else Color.Transparent).padding(4.dp)) {
             Box(Modifier.offset(x = offset).size(24.dp)
                 .background(if (checked) GlassInk else Color.White, CircleShape)
                 .border(.7.dp, Color.White.copy(alpha = .8f), CircleShape))
         }
     }
+}
+
+/** Uses the click recognizer's press lifecycle: cancellation/scrolling cannot leave a stuck glow. */
+@Composable
+internal fun Modifier.glassFeedback(source: MutableInteractionSource, selected: Boolean = false): Modifier {
+    var pressed by remember(source) { mutableStateOf(false) }
+    var position by remember(source) { mutableStateOf(Offset.Zero) }
+    LaunchedEffect(source) {
+        source.interactions.collect { interaction ->
+            when (interaction) {
+                is PressInteraction.Press -> { position = interaction.pressPosition; pressed = true }
+                is PressInteraction.Release, is PressInteraction.Cancel -> pressed = false
+            }
+        }
+    }
+    val light by animateFloatAsState(if (pressed) 1f else 0f, tween(if (pressed) 90 else 240), label = "touch light")
+    val selection by animateFloatAsState(if (selected) 1f else 0f, tween(200), label = "selection light")
+    return drawWithContent {
+        val radius = CornerRadius(minOf(16.dp.toPx(), size.minDimension / 2))
+        if (selection > .001f) {
+            drawRoundRect(Brush.verticalGradient(listOf(Color.White.copy(alpha = .48f * selection),
+                Color(0xffb4d4e5).copy(alpha = .20f * selection), Color.White.copy(alpha = .12f * selection))), cornerRadius = radius)
+            drawRoundRect(Brush.linearGradient(listOf(Color.White.copy(alpha = .75f * selection),
+                Color.Transparent, GlassInk.copy(alpha = .13f * selection))), cornerRadius = radius, style = Stroke(.7.dp.toPx()))
+        }
+        drawContent()
+        if (light > .001f) clipRect {
+            drawRect(Brush.radialGradient(listOf(Color.White.copy(alpha = .40f * light),
+                Color(0xffc9e5f5).copy(alpha = .12f * light), Color.Transparent),
+                center = if (position == Offset.Unspecified) center else position, radius = maxOf(size.minDimension * 1.2f, 1f)))
+        }
+    }
+}
+
+@Composable
+internal fun Modifier.glassClickable(selected: Boolean = false, role: Role = Role.Button, onClick: () -> Unit): Modifier {
+    val source = remember { MutableInteractionSource() }
+    return glassFeedback(source, selected).clickable(interactionSource = source, indication = null, role = role, onClick = onClick)
 }

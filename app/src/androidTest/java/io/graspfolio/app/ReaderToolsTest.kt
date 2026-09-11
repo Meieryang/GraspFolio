@@ -51,7 +51,7 @@ class ReaderToolsTest {
                 bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it)
             }
         }
-        compose.onNodeWithContentDescription("返回沉浸阅读").assertIsDisplayed()
+        compose.onNodeWithContentDescription("退出阅读").assertIsDisplayed()
         capture("toolbar")
         compose.onNodeWithContentDescription("压感笔").performClick()
         compose.onNodeWithText("荧光笔").performClick()
@@ -61,7 +61,7 @@ class ReaderToolsTest {
         compose.onNodeWithContentDescription("阅读设置与保存").performClick()
         compose.onNodeWithText("阅读设置").assertIsDisplayed()
         capture("settings")
-        compose.onNodeWithContentDescription("返回沉浸阅读").performClick()
+        compose.onNodeWithContentDescription("退出阅读").performClick()
         compose.runOnIdle { assertTrue(closed) }
     }
 }

@@ -46,6 +46,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.key
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -125,7 +126,8 @@ private fun PdfReader(uri: Uri, onOpenAnother: () -> Unit, onExit: () -> Unit) {
         onDispose { readerLifecycle.removeObserver(observer) }
     }
     var pageContactSequence by remember { mutableIntStateOf(0) }
-    var menu by rememberSaveable(uri.toString()) { mutableStateOf(false) }
+    var chrome by rememberSaveable(uri.toString()) { mutableStateOf(ReaderChrome.READING) }
+    val menu = chrome == ReaderChrome.MENU
     var lasso by rememberSaveable { mutableStateOf(false) }
     var eraser by rememberSaveable { mutableStateOf(false) }
     val penSettings = remember { context.getSharedPreferences("pen_settings", Context.MODE_PRIVATE) }
@@ -137,7 +139,7 @@ private fun PdfReader(uri: Uri, onOpenAnother: () -> Unit, onExit: () -> Unit) {
     var frontBufferEnabled by rememberSaveable { mutableStateOf(penSettings.getBoolean("front_buffer", true)) }
     var penDiagnostics by remember { mutableStateOf("写几笔后显示 SDK 状态和绘制耗时") }
     var penContact by remember { mutableStateOf(false) }
-    BackHandler { menu = !menu }
+    BackHandler { chrome = chrome.onBack() }
     val folderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { it?.let(annotations::authorize) }
     val progressStore = remember(context) { ReadingProgressStore(context) }
     val savedProgress = remember(uri) { progressStore.load(uri.toString()) }
@@ -254,11 +256,13 @@ private fun PdfReader(uri: Uri, onOpenAnother: () -> Unit, onExit: () -> Unit) {
                 }
             }
         }
-        if (menu) ReaderTools(
+        if (chrome != ReaderChrome.READING) key(menu) { ReaderTools(
+            immersiveBar = !menu,
+            brushColor = { penSettings.loadBrush(it).opaqueColor },
             lasso = lasso, onLasso = { lasso = true; eraser = false },
             dismissBrushRequest = pageContactSequence,
             style = brushStyle, eraser = eraser, onStyle = selectStyle,
-            onBrush = { selectStyle(penSettings.loadBrush(it)) }, onEraser = { lasso = false; eraser = it }, onClose = { menu = false },
+            onBrush = { selectStyle(penSettings.loadBrush(it)) }, onEraser = { lasso = false; eraser = it }, onClose = { chrome = if (menu) ReaderChrome.WRITING else ReaderChrome.READING },
             page = page, pageCount = document?.pageCount ?: 0,
             onPage = { target -> document?.takeIf { annotations.ready }?.let { doc -> page = readingPages(target, doc.pageCount, spread, cover).filterNotNull().first(); annotations.saveProgress(ReadingProgress(page, cover)) } },
             spread = spread, cover = cover, onCover = { if (annotations.ready) { cover = !cover; annotations.saveProgress(ReadingProgress(page, cover)) } },
@@ -270,7 +274,7 @@ private fun PdfReader(uri: Uri, onOpenAnother: () -> Unit, onExit: () -> Unit) {
                 penSettings.edit().putBoolean("double_tap_enabled", enabled).apply()
             },
             diagnostics = penDiagnostics, saveStatus = annotations.status, onAuthorize = { folderPicker.launch(null) }, onRetry = annotations::retry, onExit = onExit
-        )
+        ) }
     }
 }
 

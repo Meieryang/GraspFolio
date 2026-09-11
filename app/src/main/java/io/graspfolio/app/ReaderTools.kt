@@ -55,7 +55,9 @@ internal fun ReaderTools(
     initialPanel: String? = null,
     dismissBrushRequest: Int = 0,
     lasso: Boolean = false, onLasso: () -> Unit = {},
-    doubleTapEnabled: Boolean = true, onDoubleTapEnabled: (Boolean) -> Unit = {}
+    doubleTapEnabled: Boolean = true, onDoubleTapEnabled: (Boolean) -> Unit = {},
+    immersiveBar: Boolean = false,
+    brushColor: (String) -> Int = { if (it == "highlighter") Swatches[3] else Swatches[0] }
 ) {
     var panel by rememberSaveable { mutableStateOf(initialPanel) }
     var lastDismissRequest by remember { mutableIntStateOf(dismissBrushRequest) }
@@ -67,14 +69,14 @@ internal fun ReaderTools(
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val compact = maxWidth < 420.dp
         val panelHeight = minOf(maxHeight * .7f, (maxHeight - 160.dp).coerceAtLeast(96.dp))
-        Row(Modifier.align(Alignment.TopCenter).padding(top = 16.dp, start = if (compact) 8.dp else 12.dp, end = if (compact) 8.dp else 12.dp),
+        Row(Modifier.align(Alignment.TopCenter).padding(top = if (immersiveBar) 0.dp else 16.dp, start = if (compact) 8.dp else 12.dp, end = if (compact) 8.dp else 12.dp),
             horizontalArrangement = Arrangement.spacedBy(if (compact) 8.dp else 10.dp), verticalAlignment = Alignment.Top) {
             Box {
                 // Separate the tray surface from its contents so the tips are not clipped.
                 Box(Modifier.matchParentSize().padding(bottom = 18.dp).glass(22))
                 Row(Modifier.padding(horizontal = 4.dp), verticalAlignment = Alignment.Top) {
                     for (type in OfferedBrushes) RealisticTool(type, brushName(type), !eraser && !lasso && style.brush == type,
-                        if (type == style.brush) Color(style.opaqueColor) else if (type == "highlighter") Color(Swatches[3]) else Color(Swatches[0]),
+                        if (type == style.brush) Color(style.opaqueColor) else Color(brushColor(type)),
                         compact) {
                         val alreadySelected = !eraser && !lasso && style.brush == type
                         onBrush(type); onEraser(false)
@@ -91,12 +93,14 @@ internal fun ReaderTools(
                     }
                 }
             }
+            if (!immersiveBar) {
             DoubleTapButton(doubleTapEnabled, onDoubleTapEnabled)
             Box(Modifier.glass()) { ToolButton("settings", "阅读设置与保存", panel == "settings") { panel = if (panel == "settings") null else "settings" } }
-            Box(Modifier.glass()) { ToolButton("close", "返回沉浸阅读", false, onClose) }
+            }
+            Box(Modifier.glass()) { ToolButton(if (immersiveBar) "close" else "exit", if (immersiveBar) "关闭沉浸画笔栏" else "退出阅读", false, if (immersiveBar) onClose else onExit) }
         }
 
-        if (panel == "brush") Column(Modifier.align(Alignment.TopCenter).padding(top = 84.dp, start = 16.dp, end = 16.dp)
+        if (panel == "brush") Column(Modifier.align(Alignment.TopCenter).padding(top = if (immersiveBar) 68.dp else 84.dp, start = 16.dp, end = 16.dp)
             .widthIn(max = 380.dp).fillMaxWidth().heightIn(max = panelHeight).glass(24)
             .verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
             Text("书写工具", color = ToolInk, style = MaterialTheme.typography.titleMedium)
@@ -140,10 +144,9 @@ internal fun ReaderTools(
             var details by remember { mutableStateOf(false) }
             TextButton(onClick = { details = !details }) { Text(if (details) "收起书写诊断" else "书写诊断", color = ToolInk) }
             if (details) Text(diagnostics + "\n荧光笔使用单次透明合成，避免抬笔变深。", color = ToolMuted, style = MaterialTheme.typography.labelSmall)
-            TextButton(onClick = onExit, modifier = Modifier.liquidGlass(18)) { Text("退出阅读", color = ToolInk) }
         }
 
-        if (pageCount > 0) {
+        if (!immersiveBar && pageCount > 0) {
             var scrub by remember(page) { mutableFloatStateOf(page.toFloat()) }
             Row(Modifier.align(Alignment.BottomCenter).padding(16.dp).widthIn(max = 920.dp).fillMaxWidth().glass()
                 .padding(horizontal = 18.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(14.dp)) {
@@ -184,7 +187,7 @@ private fun SettingSwitch(label: String, checked: Boolean, onClick: () -> Unit) 
 @Composable
 private fun ColorButton(color: Int, selected: Boolean, onClick: () -> Unit) {
     val name = when (color) { Swatches[0] -> "墨黑"; Swatches[1] -> "雾蓝"; Swatches[2] -> "陶粉"; Swatches[3] -> "暖黄"; Swatches[4] -> "鼠尾草绿"; Swatches[5] -> "淡紫"; else -> "当前颜色" }
-    Box(Modifier.size(48.dp).clip(CircleShape).clickable(role = Role.RadioButton, onClick = onClick)
+    Box(Modifier.size(48.dp).clip(CircleShape).glassClickable(selected, Role.RadioButton, onClick)
         .semantics { contentDescription = name; this.selected = selected }, contentAlignment = Alignment.Center) {
         Box(Modifier.size(if (selected) 28.dp else 22.dp).border(if (selected) 2.dp else 0.dp, if (selected) ToolInk else Color.Transparent, CircleShape)
             .padding(4.dp).background(Color(color), CircleShape))
@@ -193,13 +196,18 @@ private fun ColorButton(color: Int, selected: Boolean, onClick: () -> Unit) {
 
 @Composable
 private fun ToolButton(icon: String, label: String, selected: Boolean, onClick: () -> Unit) {
-    Box(Modifier.size(40.dp).clip(CircleShape).clickable(role = Role.Button, onClick = onClick)
+    Box(Modifier.size(40.dp).clip(CircleShape).glassClickable(selected, Role.Button, onClick)
         .semantics { contentDescription = label; this.selected = selected }.padding(4.dp)
         .background(if (selected) ToolInk.copy(alpha = .11f) else Color.Transparent, CircleShape), contentAlignment = Alignment.Center) {
         Canvas(Modifier.size(24.dp)) {
             fun p(x: Float, y: Float) = Offset(x * size.width / 24, y * size.height / 24)
             fun line(x: Float, y: Float, x2: Float, y2: Float) = drawLine(ToolInk, p(x, y), p(x2, y2), 1.7.dp.toPx(), StrokeCap.Round)
             when (icon) {
+                "exit" -> {
+                    line(12f, 4f, 4f, 4f); line(4f, 4f, 4f, 20f); line(4f, 20f, 12f, 20f)
+                    line(12f, 4f, 12f, 8f); line(12f, 16f, 12f, 20f)
+                    line(9f, 12f, 21f, 12f); line(17f, 8f, 21f, 12f); line(21f, 12f, 17f, 16f)
+                }
                 "close" -> { line(6f, 6f, 18f, 18f); line(18f, 6f, 6f, 18f) }
                 "chevron" -> { line(7f, 10f, 12f, 15f); line(12f, 15f, 17f, 10f) }
                 "settings" -> { for (y in listOf(6f, 12f, 18f)) line(4f, y, 20f, y); for ((x, y) in listOf(9f to 6f, 15f to 12f, 8f to 18f)) { drawCircle(Color(0xfff5f6f5), 3.dp.toPx(), p(x, y)); drawCircle(ToolInk, 2.dp.toPx(), p(x, y), style = Stroke(1.5.dp.toPx())) } }
@@ -213,7 +221,8 @@ private fun ToolButton(icon: String, label: String, selected: Boolean, onClick: 
 /** Stylus with two tap waves; a slash and muted colour indicate disabled. */
 @Composable
 private fun DoubleTapButton(enabled: Boolean, onChange: (Boolean) -> Unit) {
-    Box(Modifier.size(40.dp).glass().toggleable(enabled, role = Role.Switch, onValueChange = onChange)
+    val interaction = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
+    Box(Modifier.size(40.dp).glass().glassFeedback(interaction, enabled).toggleable(enabled, interactionSource = interaction, indication = null, role = Role.Switch, onValueChange = onChange)
         .semantics { contentDescription = "轻敲切换笔刷与橡皮"; stateDescription = if (enabled) "已开启" else "已关闭" }
         .padding(4.dp).background(if (enabled) ToolInk.copy(alpha = .11f) else Color.Transparent, CircleShape),
         contentAlignment = Alignment.Center) {
@@ -252,7 +261,7 @@ private fun DoubleTapButton(enabled: Boolean, onChange: (Boolean) -> Unit) {
 private fun QuickColorButton(color: Int, selected: Boolean, compact: Boolean, onClick: () -> Unit) {
     val label = when (color) { Swatches[0] -> "墨黑"; Swatches[1] -> "雾蓝"; else -> "陶粉" }
     Box(Modifier.width(if (compact) 24.dp else 32.dp).height(40.dp)
-        .clickable(role = Role.RadioButton, onClick = onClick)
+        .glassClickable(selected, Role.RadioButton, onClick)
         .semantics { contentDescription = label; this.selected = selected }, contentAlignment = Alignment.Center) {
         Box(Modifier.size(if (selected) 20.dp else 18.dp).background(Color(color), CircleShape))
     }

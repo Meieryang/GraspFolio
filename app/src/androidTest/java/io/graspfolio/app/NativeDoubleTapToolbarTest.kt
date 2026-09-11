@@ -63,33 +63,45 @@ class NativeDoubleTapToolbarTest {
         val on = awaitNode(label, true)
         if (android.os.Build.VERSION.SDK_INT >= 30) assertEquals("已开启", on.stateDescription?.toString())
         if (!landscape && !narrow) {
-            for ((name, rgb) in listOf("雾蓝" to 0x567896, "陶粉" to 0xc57968)) {
-                val swatch = Rect().also { awaitNode(name).getBoundsInScreen(it) }
-                val time = SystemClock.uptimeMillis()
-                for (action in listOf(android.view.MotionEvent.ACTION_DOWN, android.view.MotionEvent.ACTION_UP)) {
-                    val event = android.view.MotionEvent.obtain(time, SystemClock.uptimeMillis(), action,
-                        swatch.exactCenterX(), swatch.exactCenterY(), 0)
-                    event.source = android.view.InputDevice.SOURCE_TOUCHSCREEN
-                    try { assertTrue(automation.injectInputEvent(event, true)) } finally { event.recycle() }
-                }
+            fun tap(label: String) {
+                val bounds = Rect().also { awaitNode(label).getBoundsInScreen(it) }
+                ParcelFileDescriptor.AutoCloseInputStream(automation.executeShellCommand(
+                    "input tap ${bounds.centerX()} ${bounds.centerY()}"
+                )).use { it.readBytes() }
                 automation.waitForIdle(350, 5000)
-                val bounds = Rect().also { awaitNode("压感笔").getBoundsInScreen(it) }
-                val bitmap = checkNotNull(automation.takeScreenshot())
+            }
+            for ((index, choice) in listOf("雾蓝" to 0x567896, "陶粉" to 0xc57968, "雾蓝" to 0x567896).withIndex()) {
+                val (name, rgb) = choice
+                if (index == 2) tap("荧光笔")
+                val swatch = Rect().also { awaitNode(name).getBoundsInScreen(it) }
+                ParcelFileDescriptor.AutoCloseInputStream(automation.executeShellCommand(
+                    "input tap ${swatch.centerX()} ${swatch.centerY()}"
+                )).use { it.readBytes() }
+                automation.waitForIdle(350, 5000)
+                if (index == 2) tap("压感笔")
+                val bounds = Rect().also { awaitNode(if (index == 2) "荧光笔" else "压感笔").getBoundsInScreen(it) }
+                // UiAutomation idle does not wait for Compose drawing/colour animation frames.
+                val deadline = SystemClock.uptimeMillis() + 5000
                 var matchingTipPixels = 0
-                // Inspect only the bottom quarter: the coloured barrel band cannot satisfy this check.
-                for (y in bounds.top + bounds.height() * 3 / 4 until bounds.bottom.coerceAtMost(bitmap.height)) {
-                    for (x in bounds.left.coerceAtLeast(0) until bounds.right.coerceAtMost(bitmap.width)) {
-                        val pixel = bitmap.getPixel(x, y)
-                        if (kotlin.math.abs(android.graphics.Color.red(pixel) - ((rgb shr 16) and 255)) < 12 &&
-                            kotlin.math.abs(android.graphics.Color.green(pixel) - ((rgb shr 8) and 255)) < 12 &&
-                            kotlin.math.abs(android.graphics.Color.blue(pixel) - (rgb and 255)) < 12) matchingTipPixels++
+                while (SystemClock.uptimeMillis() < deadline && matchingTipPixels <= 5) {
+                    val bitmap = checkNotNull(automation.takeScreenshot())
+                    matchingTipPixels = 0
+                    // Only the bottom quarter: a coloured barrel band cannot satisfy this check.
+                    for (y in bounds.top + bounds.height() * 3 / 4 until bounds.bottom.coerceAtMost(bitmap.height)) {
+                        for (x in bounds.left.coerceAtLeast(0) until bounds.right.coerceAtMost(bitmap.width)) {
+                            val pixel = bitmap.getPixel(x, y)
+                            if (kotlin.math.abs(android.graphics.Color.red(pixel) - ((rgb shr 16) and 255)) < 12 &&
+                                kotlin.math.abs(android.graphics.Color.green(pixel) - ((rgb shr 8) and 255)) < 12 &&
+                                kotlin.math.abs(android.graphics.Color.blue(pixel) - (rgb and 255)) < 12) matchingTipPixels++
+                        }
                     }
+                    bitmap.recycle()
+                    if (matchingTipPixels <= 5) Thread.sleep(50)
                 }
-                bitmap.recycle()
                 assertTrue("$name must colour the actual pen tip", matchingTipPixels > 5)
                 screenshot(name)
             }
         }
-        awaitNode("返回沉浸阅读").performAction(AccessibilityNodeInfo.ACTION_CLICK)
+        awaitNode("退出阅读").performAction(AccessibilityNodeInfo.ACTION_CLICK)
     }
 }

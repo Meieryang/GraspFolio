@@ -2,6 +2,7 @@ package io.graspfolio.app
 
 import android.content.pm.ActivityInfo
 import android.os.Bundle
+import androidx.activity.compose.BackHandler
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -20,6 +21,7 @@ import io.graspfolio.app.ui.theme.GraspFolioTheme
 class ReaderToolsPreviewActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        val chromeCycle = intent.getBooleanExtra("chromeCycle", false)
         val narrow = intent.getBooleanExtra("narrow", false)
         val landscape = intent.getBooleanExtra("landscape", false)
         requestedOrientation = if (landscape) ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE else ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
@@ -29,10 +31,16 @@ class ReaderToolsPreviewActivity : ComponentActivity() {
             GraspFolioTheme(darkTheme = false, dynamicColor = false) {
                 ImmersiveReading()
                 var style by remember { mutableStateOf(BrushStyle()) }
+                val savedBrushes = remember { mutableStateMapOf<String, BrushStyle>() }
+                fun selectStyle(value: BrushStyle) { style = value; savedBrushes[value.brush] = value }
+                fun savedStyle(type: String) = savedBrushes[type] ?: BrushStyle(type,
+                    if (type == "highlighter") 0xfff1ce58.toInt() else 0xff111111.toInt(), BrushStyle.defaultWidth(type))
                 var doubleTapEnabled by remember { mutableStateOf(true) }
                 var lasso by remember { mutableStateOf(false) }
                 var eraser by remember { mutableStateOf(false) }
                 var page by remember { mutableIntStateOf(5) }
+                var chrome by remember { mutableStateOf(ReaderChrome.READING) }
+                BackHandler(enabled = chromeCycle) { chrome = chrome.onBack() }
                 Box(Modifier.widthIn(max = if (narrow) 360.dp else androidx.compose.ui.unit.Dp.Infinity).fillMaxSize().background(Color(0xfff8f4ec))) {
                     Row(Modifier.fillMaxSize().glassSource().padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(2.dp)) {
                         repeat(if (landscape) 2 else 1) { index ->
@@ -44,10 +52,11 @@ class ReaderToolsPreviewActivity : ComponentActivity() {
                             }
                         }
                     }
-                    ReaderTools(style, eraser, { style = it }, { style = BrushStyle(it, if (it == "highlighter") 0xfff1ce58.toInt() else 0xff111111.toInt(), BrushStyle.defaultWidth(it)) },
-                        { lasso = false; eraser = it }, { finish() }, page, 128, { page = it }, landscape, true, {}, true, {}, true, {}, true, {},
+                    if (!chromeCycle || chrome != ReaderChrome.READING) key(chrome) { ReaderTools(style, eraser, { selectStyle(it) }, { selectStyle(savedStyle(it)) },
+                        { lasso = false; eraser = it }, { if (chromeCycle) chrome = if (chrome == ReaderChrome.MENU) ReaderChrome.WRITING else ReaderChrome.READING else finish() }, page, 128, { page = it }, landscape, true, {}, true, {}, true, {}, true, {},
                         "独立 UI 预览 · 不访问用户 PDF 或批注", "已同步 · UI 预览状态", {}, {}, { finish() }, initialPanel = panel, lasso = lasso, onLasso = { lasso = true; eraser = false },
-                        doubleTapEnabled = doubleTapEnabled, onDoubleTapEnabled = { doubleTapEnabled = it })
+                        doubleTapEnabled = doubleTapEnabled, onDoubleTapEnabled = { doubleTapEnabled = it },
+                        immersiveBar = chromeCycle && chrome == ReaderChrome.WRITING, brushColor = { savedStyle(it).opaqueColor }) }
                 }
             }
         }
