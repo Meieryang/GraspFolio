@@ -35,7 +35,8 @@ internal fun pdfDigest(context: Context, target: Uri): String {
     return hash.digest().joinToString("") { "%02x".format(it) }
 }
 
-internal data class SidecarResult(val hash: String, val imported: List<InkStroke>? = null)
+internal data class SidecarResult(val hash: String, val imported: List<InkStroke>? = null,
+    val progress: ReadingProgress? = null, val acknowledgedRevision: Long? = null)
 
 /** Only the external-sync thread accesses this object. No access to mutable local-writer state. */
 internal class AnnotationSidecar(private val context: Context, private val uri: Uri, private val identity: String) {
@@ -61,24 +62,91 @@ internal class AnnotationSidecar(private val context: Context, private val uri: 
             require(pdfDigest(context, pdf) == identity) { "所选目录中的同名 PDF 内容不同" }
             validatedFolder = folder; validatedPdfStamp = stamp
         }
-        val sides = matches.filter { it.first == sideName }
-        require(sides.size <= 1) { "发现多个同名批注文件" }
-        var side = sides.singleOrNull()?.second
-        val remote = side?.let { resolver.openInputStream(it)!!.use { input -> input.readBytes() } }
+        val files = SafSidecarFiles(context, folder)
+        val transactionDir = File(context.filesDir, "sidecar-transactions").apply { check(exists() || mkdirs()) }
+        val key = inkDigest("$uri|$folder|$identity".toByteArray())
+        val transaction = SidecarTransaction(files, AtomicSidecarTransactionLog(File(transactionDir, "$key.json")), sideName)
+        transaction.recover(snapshot.base, snapshot.revision, snapshot.syncedRevision)?.let {
+            return SidecarResult(it.hash, acknowledgedRevision = it.revision)
+        }
+        val remote = files.read(sideName)
         val remoteHash = remote?.let(::inkDigest)
         if (shouldLoadRemote(snapshot.base, remoteHash, snapshot.dirty)) {
             require(allowLoad) { "旁文件已变化，请通过菜单重试同步以载入" }
-            return SidecarResult(remoteHash!!, InkCodec.decode(remote!!.toString(Charsets.UTF_8), identity))
+            val document = InkCodec.decodeDocument(remote!!.toString(Charsets.UTF_8), identity)
+            return SidecarResult(remoteHash!!, document.strokes, document.progress)
         }
-        // An unchanged hash is proof that this is the previously validated file: no JSON parse.
-        if (!snapshot.dirty && side != null) return SidecarResult(remoteHash!!)
-        val content = InkPerformance.measure("sidecar_encode") { InkCodec.encode(identity, snapshot.strokes).toByteArray() }
-        if (side == null) side = DC.createDocument(resolver, DC.buildDocumentUriUsingTree(folder, DC.getTreeDocumentId(folder)),
-            "application/octet-stream", sideName) ?: error("无法创建旁文件")
-        resolver.openOutputStream(side, "wt")!!.use { it.write(content) }
-        val verified = resolver.openInputStream(side)!!.use { it.readBytes() }
-        val hash = inkDigest(verified)
-        require(hash == inkDigest(content)) { "旁文件写入校验失败" }
-        return SidecarResult(hash)
+        if (!snapshot.dirty && remote != null) return SidecarResult(remoteHash!!)
+        val content = InkPerformance.measure("sidecar_encode") {
+            InkCodec.encodeDocument(identity, snapshot.strokes, snapshot.progress ?: ReadingProgress()).toByteArray()
+        }
+        return try { SidecarResult(transaction.write(remoteHash, content, snapshot.revision)) }
+        catch (failure: Exception) {
+            // If the provider is still accessible, restore the old name immediately. A process
+            // death follows the same recovery path on the next open/retry instead.
+            try {
+                transaction.recover(snapshot.base, snapshot.revision, snapshot.syncedRevision)?.let {
+                    return SidecarResult(it.hash, acknowledgedRevision = it.revision)
+                }
+            } catch (recoveryFailure: Exception) { failure.addSuppressed(recoveryFailure) }
+            throw failure
+        }
     }
+}
+
+internal class SafSidecarFiles(private val context: Context, private val folder: Uri) : SidecarFiles {
+    private val resolver get() = context.contentResolver
+    private val parent get() = DC.buildDocumentUriUsingTree(folder, DC.getTreeDocumentId(folder))
+    private fun find(name: String): Uri? {
+        val children = DC.buildChildDocumentsUriUsingTree(folder, DC.getTreeDocumentId(folder))
+        val found = mutableListOf<Uri>()
+        resolver.query(children, arrayOf(DC.Document.COLUMN_DOCUMENT_ID, DC.Document.COLUMN_DISPLAY_NAME), null, null, null)?.use { c ->
+            while (c.moveToNext()) if (c.getString(1) == name) found += DC.buildDocumentUriUsingTree(folder, c.getString(0))
+        } ?: error("无法读取保存目录")
+        require(found.size <= 1) { "目录中有多个同名文件：$name" }
+        return found.singleOrNull()
+    }
+    override fun read(name: String): ByteArray? = find(name)?.let { target ->
+        resolver.openInputStream(target)?.use { it.readBytes() } ?: error("无法读取保存文件")
+    }
+    override fun create(name: String, bytes: ByteArray) {
+        require(find(name) == null) { "保存临时文件已存在" }
+        val target = DC.createDocument(resolver, parent, "application/octet-stream", name) ?: error("无法创建保存临时文件")
+        resolver.openOutputStream(target, "w")?.use { it.write(bytes) } ?: error("无法写入保存临时文件")
+    }
+    override fun canRename(name: String): Boolean {
+        val target = find(name) ?: return false
+        return resolver.query(target, arrayOf(DC.Document.COLUMN_FLAGS), null, null, null)?.use {
+            it.moveToFirst() && it.getInt(0) and DC.Document.FLAG_SUPPORTS_RENAME != 0
+        } == true
+    }
+    override fun rename(from: String, to: String) {
+        require(find(to) == null) { "保存目标已存在，未覆盖" }
+        val source = find(from) ?: error("保存源文件不见了")
+        check(DC.renameDocument(resolver, source, to) != null) { "存储位置未能重命名保存文件" }
+    }
+    override fun delete(name: String) { find(name)?.let { check(DC.deleteDocument(resolver, it)) { "无法清理保存临时文件" } } }
+}
+
+internal class AtomicSidecarTransactionLog(file: File) : SidecarTransactionLog {
+    private val atomic = android.util.AtomicFile(file)
+    override fun load(): PendingSidecar? {
+        val text = try { atomic.openRead().bufferedReader().use { it.readText() } }
+            catch (_: java.io.FileNotFoundException) { return null }
+        val root = org.json.JSONObject(text)
+        require(root.getInt("version") == 1)
+        val pending = PendingSidecar(root.optString("old").ifEmpty { null }, root.getString("new"),
+            root.getLong("revision"), root.getString("staged"), root.getString("backup"))
+        require(pending.revision >= 0 && pending.newHash.matches(Regex("[0-9a-f]{64}")))
+        require(pending.oldHash == null || pending.oldHash.matches(Regex("[0-9a-f]{64}")))
+        return pending
+    }
+    override fun save(value: PendingSidecar) {
+        val text = org.json.JSONObject().put("version", 1).put("old", value.oldHash ?: "").put("new", value.newHash)
+            .put("revision", value.revision).put("staged", value.staged).put("backup", value.backup).toString()
+        val output = atomic.startWrite()
+        try { output.write(text.toByteArray()); atomic.finishWrite(output) }
+        catch (failure: Exception) { atomic.failWrite(output); throw failure }
+    }
+    override fun clear() = atomic.delete()
 }

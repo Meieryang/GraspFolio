@@ -27,6 +27,49 @@ class CornerNavigationTest {
 
     @Test fun leftHoldSurvivesPageRecompositionAndStopsOnRelease() = checkHold(-1)
 
+    @Test fun leavingCornerAndReturningDoesNotTurnOrStartHold() {
+        var turns = 0
+        var starts = 0
+        compose.setContent {
+            Box(Modifier.size(400.dp).testTag("reader").cornerNavigationInput(
+                documentKey = "cancel-test", onNavigate = { turns++ },
+                onContinuousStart = { _, _ -> starts++ }, onContinuousMove = {}, onContinuousEnd = {}
+            )) { AndroidView(factory = { StylusInkView(it) }, modifier = Modifier.fillMaxSize()) }
+        }
+        compose.onNodeWithTag("reader").performTouchInput {
+            down(Offset(width - 10f, 10f))
+            moveTo(Offset(width / 2f, height / 2f))
+        }
+        Thread.sleep(750)
+        compose.onNodeWithTag("reader").performTouchInput {
+            moveTo(Offset(width - 10f, 10f))
+            up()
+        }
+        compose.runOnIdle { assertEquals(0, turns); assertEquals(0, starts) }
+        // Cancellation must not disable the next intentional tap.
+        compose.onNodeWithTag("reader").performTouchInput {
+            down(Offset(width - 10f, 10f)); up()
+        }
+        compose.runOnIdle { assertEquals(1, turns) }
+    }
+
+    @Test fun spineTapAndHoldAreIgnored() {
+        var turns = 0
+        compose.setContent {
+            Box(Modifier.size(800.dp, 400.dp).testTag("reader").cornerNavigationInput(
+                documentKey = "spread", onNavigate = { turns++ },
+                onContinuousStart = { _, _ -> }, onContinuousMove = {}, onContinuousEnd = {}
+            ))
+        }
+        compose.onNodeWithTag("reader").performTouchInput {
+            down(Offset(width / 2f - 10f, 10f)); up()
+            down(Offset(width / 2f + 10f, 10f))
+        }
+        Thread.sleep(750)
+        compose.onNodeWithTag("reader").performTouchInput { up() }
+        compose.runOnIdle { assertEquals(0, turns) }
+    }
+
     private fun checkHold(direction: Int) {
         var page by mutableIntStateOf(10)
         var continuous by mutableStateOf(false)
@@ -55,7 +98,18 @@ class CornerNavigationTest {
             assertTrue(continuous)
             assertEquals(1, startCount)
         }
-        compose.onNodeWithTag("reader").performTouchInput { up() }
+        // After activation, dragging away from the corner controls speed rather than cancelling.
+        var beforeDrag = 0
+        compose.runOnIdle { beforeDrag = page }
+        compose.onNodeWithTag("reader").performTouchInput {
+            moveTo(Offset(if (direction > 0) width - 10f else 10f, height * .7f))
+        }
+        compose.waitUntil(timeoutMillis = 3_000) { page != beforeDrag }
+        compose.runOnIdle { assertTrue(continuous); assertEquals(1, startCount) }
+        compose.onNodeWithTag("reader").performTouchInput {
+            moveTo(Offset(if (direction > 0) width - 10f else 10f, 10f))
+            up()
+        }
         var stoppedPage = 0
         compose.runOnIdle {
             assertEquals(false, continuous)

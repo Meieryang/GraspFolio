@@ -64,9 +64,24 @@ internal class StylusInkView(context: Context) : FrameLayout(context), DefaultLi
         set(value) { if (field != value) { cancelStroke(); resetFront(); field = value; report() } }
     private fun resetFront() { if (Build.VERSION.SDK_INT >= 29) front?.reset() }
     var placements: List<PagePlacement> = emptyList()
-        set(value) { if (field != value) { cancelStroke(); resetFront(); field = value; invalidate() } }
+        set(value) { if (field != value) { cancelStroke(); clearLassoPreview(); selection.clear(); resetFront(); field = value; invalidate() } }
     var strokes: List<InkStroke> = emptyList()
-        set(value) { if (field !== value) { field = value; invalidate() } }
+        set(value) { if (field !== value) { stopLassoWork(); clearLassoPreview(); selection.clear(); field = value; invalidate() } }
+    private val selection = LassoSelection()
+    private var lassoPreview: LassoPreview? = null
+    private var lassoWork: java.util.concurrent.Future<*>? = null
+    private var lassoGeneration = 0
+    internal var lassoBusy = false; private set
+    private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private fun clearLassoPreview() { lassoPreview?.release(); lassoPreview = null }
+    private fun stopLassoWork() { lassoGeneration++; lassoWork?.cancel(true); lassoWork = null; lassoBusy = false }
+    companion object {
+        private val lassoWorker = java.util.concurrent.Executors.newSingleThreadExecutor { task ->
+            Thread(task, "lasso-worker").apply { isDaemon = true }
+        }
+    }
+    var lasso = false
+        set(value) { if (field != value) { cancelStroke(); clearLassoPreview(); selection.clear(); field = value; invalidate() } }
     var eraser = false
     var brushStyle = BrushStyle()
     private var activeStyle = BrushStyle()
@@ -77,13 +92,22 @@ internal class StylusInkView(context: Context) : FrameLayout(context), DefaultLi
         set(value) { if (field && !value) { cancelStroke(); resetFront() }; field = value }
     var onChange: (List<InkStroke>) -> Unit = {}
     var onContact: (Boolean) -> Unit = {}
+    var onPageContact: () -> Unit = {}
     var onToggle: () -> Unit = {}
     var onDiagnostics: (String) -> Unit = {}
     private val activity = generateSequence(context) { (it as? ContextWrapper)?.baseContext }.filterIsInstance<Activity>().first()
     private val owner = activity as LifecycleOwner
     private var foreground = false
+    private val doubleTapSwitch = DoubleTapSwitch()
+    var doubleTapEnabled: Boolean
+        get() = doubleTapSwitch.enabled
+        set(value) { doubleTapSwitch.enabled = value }
     private val sdk = VivoPenAdapter(activity) {
-        if (foreground && enabledForWriting && active == null) { post { onToggle() }; true } else false
+        doubleTapSwitch.dispatch(
+            canToggle = { foreground && enabledForWriting && active == null },
+            enqueue = { action -> post { action() } },
+            toggle = { onToggle() }
+        )
     }
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { strokeCap = Paint.Cap.ROUND; strokeJoin = Paint.Join.ROUND }
     private var active: PagePlacement? = null
@@ -94,7 +118,7 @@ internal class StylusInkView(context: Context) : FrameLayout(context), DefaultLi
     private val erased = mutableSetOf<String>()
     private val normalizer = PenEventNormalizer()
     private var penDownTime = 0L
-    private val committed = CommittedInkCache()
+    private var committed = CommittedInkCache()
     private val spatial = InkSpatialIndex()
     private val live = InkRasterCache()
     private var liveCount = 0
@@ -123,7 +147,7 @@ internal class StylusInkView(context: Context) : FrameLayout(context), DefaultLi
         owner.lifecycle.addObserver(this)
     }
     override fun onDetachedFromWindow() {
-        cancelStroke()
+        cancelStroke(); clearLassoPreview()
         if (Build.VERSION.SDK_INT >= 29) front?.let { it.close(); removeView(it.view) }
         front = null
         sdk.stop(); committed.release(); live.release(); owner.lifecycle.removeObserver(this); super.onDetachedFromWindow()
@@ -132,8 +156,10 @@ internal class StylusInkView(context: Context) : FrameLayout(context), DefaultLi
     override fun onResume(owner: LifecycleOwner) { foreground = true; sdk.start() }
     override fun onPause(owner: LifecycleOwner) { foreground = false; cancelStroke(); resetFront(); sdk.stop() }
     fun cancelStroke() {
+        stopLassoWork()
         if (Build.VERSION.SDK_INT >= 29) front?.cancelActive()
         frontStroke = false; frontSentCount = 0
+        selection.cancel()
         if (pointer != -1 && predictionEnabled) {
             val cancel = MotionEvent.obtain(penDownTime, SystemClock.uptimeMillis(), MotionEvent.ACTION_CANCEL, 0f, 0f, 0)
             try { sdk.predict(cancel) } finally { cancel.recycle() }
@@ -144,13 +170,21 @@ internal class StylusInkView(context: Context) : FrameLayout(context), DefaultLi
     }
     override fun onTouchEvent(event: MotionEvent): Boolean {
         val actionIndex = event.actionIndex
+        if ((event.actionMasked == MotionEvent.ACTION_DOWN || event.actionMasked == MotionEvent.ACTION_POINTER_DOWN) &&
+            placements.any { it.contains(event.getX(actionIndex), event.getY(actionIndex)) }) onPageContact()
         val pen = event.getToolType(actionIndex) == MotionEvent.TOOL_TYPE_STYLUS || event.getToolType(actionIndex) == MotionEvent.TOOL_TYPE_ERASER
         if (event.actionMasked == MotionEvent.ACTION_CANCEL) { cancelStroke(); return true }
         if ((event.actionMasked == MotionEvent.ACTION_DOWN || event.actionMasked == MotionEvent.ACTION_POINTER_DOWN) && pen) {
+            if (lasso && lassoBusy) return true
             cancelStroke()
             if (!enabledForWriting) return true
             val placement = placements.firstOrNull { it.contains(event.getX(actionIndex), event.getY(actionIndex)) } ?: return true
             active = placement; pointer = event.getPointerId(actionIndex); penDownTime = event.eventTime
+            if (lasso) {
+                selection.down(placement.toPage(event.getX(actionIndex), event.getY(actionIndex), 1f, event.eventTime), placement, strokes)
+                if (!selection.dragging) clearLassoPreview()
+                onContact(true); invalidate(); return true
+            }
             activeStyle = brushStyle
             drawCount = 0; drawNanos = 0; maxEventAge = 0; predictionAttempts = 0; acceptedPredictions = 0
             erasing = eraser || event.getToolType(actionIndex) == MotionEvent.TOOL_TYPE_ERASER || event.buttonState and MotionEvent.BUTTON_STYLUS_PRIMARY != 0
@@ -168,6 +202,12 @@ internal class StylusInkView(context: Context) : FrameLayout(context), DefaultLi
         if (index < 0) { cancelStroke(); return true }
         // A palm's pointer-down/up must not become a pen sample or reset SDK history.
         if ((event.actionMasked == MotionEvent.ACTION_POINTER_DOWN || event.actionMasked == MotionEvent.ACTION_POINTER_UP) && index != actionIndex) return true
+        if (lasso) {
+            selection.move(placement.toPage(event.getX(index), event.getY(index), 1f, event.eventTime), placement, strokes)
+            val up = (event.actionMasked == MotionEvent.ACTION_UP || event.actionMasked == MotionEvent.ACTION_POINTER_UP) && index == actionIndex
+            if (up) finishLasso()
+            invalidate(); return true
+        }
         requestUnbufferedDispatch(event)
         fun sample(x: Float, y: Float, pressure: Float, time: Long) {
             if (!x.isFinite() || !y.isFinite()) return
@@ -232,8 +272,14 @@ internal class StylusInkView(context: Context) : FrameLayout(context), DefaultLi
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         val begin = System.nanoTime()
-        committed.update(width, height, placements, strokes, erased, spatial)
-        committed.show(canvas)
+        val preview = lassoPreview
+        if (lasso && selection.dragging && preview != null) {
+            val page = placements.firstOrNull { it.page == selection.page }
+            preview.draw(canvas, selection.dx * (page?.scale ?: 1f), selection.dy * (page?.scale ?: 1f))
+        } else {
+            committed.update(width, height, placements, strokes, erased, spatial)
+            committed.show(canvas)
+        }
         if (Build.VERSION.SDK_INT >= 29) {
             val layer = front
             if (layer?.hasPending == true && isHardwareAccelerated) {
@@ -242,7 +288,7 @@ internal class StylusInkView(context: Context) : FrameLayout(context), DefaultLi
             }
             if (frontStroke && layer?.ready != true) frontStroke = false
         }
-        active?.takeIf { !erasing && !frontStroke }?.let { p ->
+        active?.takeIf { !lasso && !erasing && !frontStroke }?.let { p ->
             if (live.resize(width, height)) liveCount = 0
             for (i in liveCount until points.size) live.segment(p, if (i == 0) null else points[i - 1], points[i], activeStyle.opaqueColor, activeStyle.width, activeStyle.brush)
             liveCount = points.size
@@ -258,9 +304,103 @@ internal class StylusInkView(context: Context) : FrameLayout(context), DefaultLi
             canvas.restore()
             canvas.restoreToCount(opacityLayer)
         }
+        if (lasso) drawSelection(canvas)
+        if (!lasso && erasing) active?.let { p -> points.lastOrNull()?.let { point ->
+            val marker = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x22567896; style = Paint.Style.FILL }
+            val x = p.left + point.x * p.scale; val y = p.top + point.y * p.scale
+            val radius = 12f * resources.displayMetrics.density
+            canvas.drawCircle(x, y, radius, marker)
+            marker.color = 0xff567896.toInt(); marker.style = Paint.Style.STROKE; marker.strokeWidth = resources.displayMetrics.density
+            canvas.drawCircle(x, y, radius, marker)
+        } }
         if (active != null) {
             drawCount++; drawNanos += System.nanoTime() - begin
             maxEventAge = maxOf(maxEventAge, (SystemClock.uptimeMillis() - latestEventTime).coerceAtLeast(0))
         }
     }
+    private fun finishLasso() {
+        pointer = -1; active = null; onContact(false)
+        val source = strokes; val pages = placements
+        val page = selection.page; val ids = selection.selected
+        val dx = selection.dx; val dy = selection.dy
+        val moving = selection.dragging
+        if (moving && dx == 0f && dy == 0f) { selection.cancel(); invalidate(); return }
+        val outline = selection.path.toList()
+        val w = width.coerceAtLeast(1); val h = height.coerceAtLeast(1)
+        stopLassoWork()
+        val generation = lassoGeneration
+        lassoBusy = true
+        lassoWork = lassoWorker.submit {
+            var preview: LassoPreview? = null
+            var prepared: CommittedInkCache? = null
+            try {
+                val selected = if (moving) ids else LassoSelection.select(source, page, outline)
+                val moved = if (moving) source.map { stroke ->
+                    if (Thread.currentThread().isInterrupted) throw java.util.concurrent.CancellationException()
+                    if (stroke.page == page && stroke.id in selected) stroke.copy(points = stroke.points.map { it.copy(x = it.x + dx, y = it.y + dy) }) else stroke
+                } else source
+                if (moving) {
+                    prepared = CommittedInkCache()
+                    prepared.update(w, h, pages, moved, emptySet(), InkSpatialIndex())
+                }
+                if (selected.isNotEmpty()) preview = LassoPreview.build(w, h, pages, moved, selected)
+                val resultPreview = preview; val resultCache = prepared
+                mainHandler.post {
+                    if (generation == lassoGeneration && lasso && strokes === source && placements == pages &&
+                        width.coerceAtLeast(1) == w && height.coerceAtLeast(1) == h) {
+                        lassoWork = null; lassoBusy = false
+                        if (moving) {
+                            commit(moved)
+                            committed.release(); committed = checkNotNull(resultCache)
+                        }
+                        clearLassoPreview(); lassoPreview = resultPreview
+                        selection.cancel(); selection.accept(selected, page)
+                        selection.bounds(strokes) // Cache once, not at every MOVE or frame.
+                        invalidate()
+                    } else {
+                        resultPreview?.release(); resultCache?.release()
+                        if (generation == lassoGeneration) { stopLassoWork(); selection.cancel(); invalidate() }
+                    }
+                }
+            } catch (failure: Throwable) {
+                preview?.release(); prepared?.release()
+                if (failure !is java.util.concurrent.CancellationException && failure !is InterruptedException)
+                    Log.w("GraspFolioPen", "套索计算失败，保留原笔迹", failure)
+                mainHandler.post {
+                    if (generation == lassoGeneration) { stopLassoWork(); selection.cancel(); invalidate() }
+                }
+            }
+        }
+        invalidate()
+    }
+    private fun drawSelection(canvas: Canvas) {
+        val p = placements.firstOrNull { it.page == selection.page } ?: return
+        val marker = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = 0xff567896.toInt(); style = Paint.Style.STROKE
+            strokeWidth = 1.5f * resources.displayMetrics.density / p.scale
+            pathEffect = android.graphics.DashPathEffect(floatArrayOf(6f / p.scale, 5f / p.scale), 0f)
+        }
+        canvas.save()
+        canvas.clipRect(p.left, p.top, p.left + p.width * p.scale, p.top + p.height * p.scale)
+        canvas.translate(p.left, p.top); canvas.scale(p.scale, p.scale)
+        if (selection.path.isNotEmpty()) {
+            val outline = android.graphics.Path()
+            selection.path.forEachIndexed { index, point -> if (index == 0) outline.moveTo(point.x, point.y) else outline.lineTo(point.x, point.y) }
+            outline.close(); canvas.drawPath(outline, marker)
+        }
+        if (lassoBusy) {
+            marker.pathEffect = null; marker.style = Paint.Style.FILL
+            marker.textSize = 12f * resources.displayMetrics.density / p.scale
+            val anchor = selection.path.lastOrNull()
+            canvas.drawText(if (selection.dragging) "正在保存位置…" else "正在圈选…",
+                anchor?.x ?: 12f, (anchor?.y ?: 24f) + marker.textSize, marker)
+            marker.style = Paint.Style.STROKE
+        }
+        selection.bounds(strokes)?.let { b ->
+            val margin = 6f / p.scale
+            canvas.drawRoundRect(b[0] - margin, b[1] - margin, b[2] + margin, b[3] + margin, margin, margin, marker)
+        }
+        canvas.restore()
+    }
+
 }

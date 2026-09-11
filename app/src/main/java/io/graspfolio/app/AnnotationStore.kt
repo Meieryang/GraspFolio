@@ -16,15 +16,22 @@ import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
+internal data class InkDocument(val strokes: List<InkStroke>, val progress: ReadingProgress?)
+
 internal object InkCodec {
-    fun encode(identity: String, strokes: List<InkStroke>): String = JSONObject().put("version", 1).put("document", identity)
+    fun encodeDocument(identity: String, strokes: List<InkStroke>, progress: ReadingProgress?): String =
+        root(identity, strokes).put("version", 2).put("reading", progress?.toJson() ?: JSONObject.NULL).toString()
+    fun encode(identity: String, strokes: List<InkStroke>): String = root(identity, strokes).toString()
+    private fun root(identity: String, strokes: List<InkStroke>): JSONObject = JSONObject().put("version", 1).put("document", identity)
         .put("strokes", JSONArray().apply { strokes.forEach { s -> put(JSONObject().put("id", s.id).put("page", s.page)
             .put("color", s.color).put("width", s.width.toDouble()).put("brush", s.brush).put("points", JSONArray().apply {
                 s.points.forEach { p -> put(JSONArray().put(p.x.toDouble()).put(p.y.toDouble()).put(p.pressure.toDouble()).put(p.time)) }
-            })) } }).toString()
-    fun decode(text: String, identity: String): List<InkStroke> {
+            })) } })
+    fun decode(text: String, identity: String): List<InkStroke> = decodeDocument(text, identity).strokes
+    fun decodeDocument(text: String, identity: String): InkDocument {
         val root = JSONObject(text)
-        require(root.getInt("version") == 1 && root.getString("document") == identity) { "批注版本或 PDF 身份不匹配" }
+        require(root.getInt("version") in 1..2 && root.getString("document") == identity) { "批注版本或 PDF 身份不匹配" }
+        val reading = if (root.getInt("version") == 2) { require(root.has("reading")); readProgress(root) } else null
         val items = root.getJSONArray("strokes")
         val result = (0 until items.length()).map { i ->
             val s = items.getJSONObject(i); val pts = s.getJSONArray("points")
@@ -38,7 +45,7 @@ internal object InkCodec {
             }
         }
         require(result.map { it.id }.distinct().size == result.size)
-        return result
+        return InkDocument(result, reading)
     }
 }
 
@@ -48,9 +55,17 @@ internal class AnnotationStore internal constructor(private val context: Context
     private val backend: AnnotationBackend = SafAnnotationBackend(context, uri)) {
     companion object {
         private val stores = mutableMapOf<String, AnnotationStore>()
-        @Synchronized fun obtain(context: Context, uri: Uri) = stores.getOrPut(uri.toString()) { AnnotationStore(context.applicationContext, uri) }
+        @Synchronized fun obtain(context: Context, uri: Uri, backend: AnnotationBackend = SafAnnotationBackend(context.applicationContext, uri)): AnnotationStore {
+            val store = stores.getOrPut(uri.toString()) { AnnotationStore(context.applicationContext, uri, backend) }
+            store.readers++
+            return store
+        }
     }
+    private var readers = 0 // Protected by the companion monitor.
+    private var retired = false
+    internal val isClosed get() = localQueue.isShutdown && remoteQueue.isShutdown
     var strokes by mutableStateOf<List<InkStroke>>(emptyList()); private set
+    var progress by mutableStateOf<ReadingProgress?>(null); private set
     var ready by mutableStateOf(false); private set
     var status by mutableStateOf("正在加载批注…"); private set
     private val localQueue = Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "InkLocalWriter") }
@@ -82,9 +97,41 @@ internal class AnnotationStore internal constructor(private val context: Context
             } catch (e: Exception) { publish("批注加载失败，已禁止书写以保护原数据：${e.message}") }
         }
     }
-    fun replace(value: List<InkStroke>) {
+    /** Keep the same coordinator during a rapid reopen; retire only after queued work drains. */
+    fun release() {
+        synchronized(Companion) {
+            check(readers > 0)
+            readers--
+            localQueue.execute {
+                timer?.cancel(false); timer = null
+                if (::journal.isInitialized && journal.state.dirty && !localFailed) startSync()
+                retireIfIdle()
+            }
+        }
+    }
+    private fun retireIfIdle() {
+        synchronized(Companion) {
+            // A failed local write can contain the only copy in memory; preserve it for retry.
+            if (readers != 0 || retired || inFlight || pendingWrites.get() != 0 || timer != null || localFailed) return
+            if (stores[uri.toString()] !== this) return
+            stores.remove(uri.toString())
+            retired = true
+            checkpointTimer?.cancel(false); checkpointTimer = null
+            remoteQueue.shutdown()
+            localQueue.shutdown()
+        }
+    }
+    fun replace(value: List<InkStroke>) = update(value, progress)
+    fun saveProgress(value: ReadingProgress) {
+        if (!ready || progress == value) return
+        require(value.page >= 0)
+        update(strokes, value)
+        ReadingProgressStore(context).save(uri.toString(), value)
+    }
+    private fun update(value: List<InkStroke>, reading: ReadingProgress?) {
         if (!ready) return
         strokes = value
+        progress = reading
         val generation = ++uiGeneration
         // Keep this label stable across successive strokes; failures remain visible.
         if (!status.startsWith("未同步")) status = "未同步 · 正在本地保护"
@@ -93,7 +140,7 @@ internal class AnnotationStore internal constructor(private val context: Context
         localQueue.execute {
             try {
                 val waitMs = (System.nanoTime() - queuedAt) / 1_000_000
-                val bytes = InkPerformance.measure("local_delta") { journal.replace(value) }
+                val bytes = InkPerformance.measure("local_delta") { journal.replace(value, reading) }
                 durableGeneration = generation; localFailed = false
                 Log.i("GraspFolioPerf", "local_delta rev=${journal.state.revision} bytes=$bytes queueMs=$waitMs pending=$pending")
                 publish(if (tree == null) "未同步 · 本地已保存，请授权 PDF 所在目录" else "未同步 · 本地已保存，等待旁文件同步")
@@ -120,13 +167,14 @@ internal class AnnotationStore internal constructor(private val context: Context
     fun retry() { if (ready) requestManual(null) }
     private fun requestManual(folder: Uri?) {
         val latest = strokes
+        val latestProgress = progress
         val generation = uiGeneration
         ready = false
         localQueue.execute {
             try {
                 // A prior failed delta may still only exist in the displayed state.
                 if (localFailed) {
-                    InkPerformance.measure("local_retry") { journal.replace(latest) }
+                    InkPerformance.measure("local_retry") { journal.replace(latest, latestProgress) }
                     localFailed = false; durableGeneration = generation
                 }
                 if (folder != null) {
@@ -143,7 +191,12 @@ internal class AnnotationStore internal constructor(private val context: Context
         }
     }
     /** Exit/background flush requests are asynchronous; the per-edit local records are already queued. */
-    fun flush() { localQueue.execute { timer?.cancel(false); timer = null; if (::journal.isInitialized && journal.state.dirty && !localFailed) startSync() } }
+    fun flush() = synchronized(Companion) {
+        if (!retired) localQueue.execute {
+            timer?.cancel(false); timer = null
+            if (::journal.isInitialized && journal.state.dirty && !localFailed) startSync()
+        }
+    }
     private fun scheduleSync() {
         if (tree == null || localFailed) return
         val now = System.nanoTime()
@@ -155,9 +208,26 @@ internal class AnnotationStore internal constructor(private val context: Context
         timer = localQueue.schedule({ timer = null; startSync() }, delay, TimeUnit.MILLISECONDS)
     }
     private fun completeManual() {
-        val loaded = journal.state.strokes
+        val legacy = ReadingProgressStore(context)
+        if (journal.state.progress == null && legacy.contains(uri.toString())) {
+            try {
+                journal.replace(journal.state.strokes, legacy.load(uri.toString()))
+                publish("未同步 · 已迁移本机阅读设置，等待同步")
+                scheduleSync()
+            } catch (failure: Exception) {
+                publish("未同步 · 阅读设置迁移失败，原本机设置已保留：${failure.message}")
+            }
+        }
+        val loaded = journal.state
         val generation = durableGeneration
-        main.post { if (uiGeneration == generation) strokes = loaded; ready = true }
+        main.post {
+            if (uiGeneration == generation) {
+                strokes = loaded.strokes
+                progress = loaded.progress
+                loaded.progress?.let { legacy.save(uri.toString(), it) }
+            }
+            ready = true
+        }
     }
     private fun startSync() {
         if (inFlight || localFailed) return
@@ -180,9 +250,9 @@ internal class AnnotationStore internal constructor(private val context: Context
                     try {
                         if (output.imported != null) {
                             require(journal.state.revision == snapshot.revision && !journal.state.dirty) { "本地状态已改变，未载入旁文件" }
-                            journal.importRemote(output.imported, output.hash)
+                            journal.importRemote(output.imported, output.hash, output.progress)
                         } else {
-                            InkPerformance.measure("local_ack") { journal.acknowledge(snapshot.revision, output.hash) }
+                            InkPerformance.measure("local_ack") { journal.acknowledge(output.acknowledgedRevision ?: snapshot.revision, output.hash) }
                         }
                         if (!localFailed) publish(if (journal.state.dirty) "未同步 · 本地已保存，等待旁文件同步" else "已同步到 PDF 旁")
                         // Compact only occasionally, not once per edit, and never before queued edits.
@@ -206,6 +276,7 @@ internal class AnnotationStore internal constructor(private val context: Context
                 } else if (manualPending) startSync()
                 else if (result.isSuccess && journal.state.dirty && !localFailed) scheduleSync()
                 // On failure, retry only after another edit or explicit user action.
+                retireIfIdle()
             }
         }
     }

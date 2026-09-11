@@ -430,6 +430,9 @@ GraspFolio 首期重点适配：
 
 GraspFolio 计划使用 vivo 官方提供的 **手写笔 SDK 2.0** 进行深度手写笔能力适配。
 
+手写笔SDK 2.0官方接入指南文档网址：
+https://dev.vivo.com.cn/documentCenter/doc/588
+
 根据目前已经确认的接入信息，SDK 的开发环境要求包括：
 
 - Android Studio；

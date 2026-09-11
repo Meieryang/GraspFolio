@@ -5,6 +5,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -26,6 +27,7 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
@@ -54,36 +56,49 @@ internal fun ReaderTools(
     writingVibration: Boolean, onVibration: () -> Unit, prediction: Boolean, onPrediction: () -> Unit,
     frontBuffer: Boolean, onFrontBuffer: () -> Unit, diagnostics: String,
     saveStatus: String, onAuthorize: () -> Unit, onRetry: () -> Unit, onExit: () -> Unit,
-    initialPanel: String? = null
+    initialPanel: String? = null,
+    dismissBrushRequest: Int = 0,
+    lasso: Boolean = false, onLasso: () -> Unit = {},
+    doubleTapEnabled: Boolean = true, onDoubleTapEnabled: (Boolean) -> Unit = {}
 ) {
     var panel by rememberSaveable { mutableStateOf(initialPanel) }
+    var lastDismissRequest by remember { mutableIntStateOf(dismissBrushRequest) }
+    LaunchedEffect(dismissBrushRequest) {
+        if (lastDismissRequest != dismissBrushRequest && panel == "brush") panel = null
+        lastDismissRequest = dismissBrushRequest
+    }
     BackHandler(enabled = panel != null) { panel = null }
     BoxWithConstraints(Modifier.fillMaxSize()) {
-        val wide = maxWidth >= 520.dp
-        val showCompactColor = maxWidth >= 360.dp
+        val compact = maxWidth < 420.dp
         val panelHeight = minOf(maxHeight * .7f, (maxHeight - 160.dp).coerceAtLeast(96.dp))
-        Row(Modifier.align(Alignment.TopCenter).padding(top = 16.dp, start = 12.dp, end = 12.dp),
-            horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
-            Row(Modifier.glass().padding(horizontal = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-                ToolButton(style.brush, brushName(style.brush), !eraser) { onEraser(false); panel = if (panel == "brush") null else "brush" }
-                ToolButton("eraser", "整笔橡皮", eraser) { onEraser(true); panel = null }
-                Box(Modifier.padding(horizontal = 4.dp).size(1.dp, 24.dp).background(ToolMuted.copy(alpha = .22f)))
-                if (wide) Swatches.take(3).forEach { color ->
-                    ColorButton(color, style.color == color && !eraser) { onStyle(style.copy(color = color)); onEraser(false) }
-                } else if (showCompactColor) ColorButton(style.color, false) { panel = if (panel == "brush") null else "brush" }
-                ToolButton("chevron", "画笔颜色与粗细", panel == "brush") { panel = if (panel == "brush") null else "brush" }
+        Row(Modifier.align(Alignment.TopCenter).padding(top = 16.dp, start = if (compact) 8.dp else 12.dp, end = if (compact) 8.dp else 12.dp),
+            horizontalArrangement = Arrangement.spacedBy(if (compact) 6.dp else 10.dp), verticalAlignment = Alignment.CenterVertically) {
+            Row(Modifier.glass(18).padding(horizontal = 2.dp), verticalAlignment = Alignment.Top) {
+                for (type in BrushStyle.types) RealisticTool(type, brushName(type), !eraser && !lasso && style.brush == type,
+                    if (type == style.brush) Color(style.opaqueColor) else if (type == "highlighter") Color(0xffebc751) else ToolInk,
+                    compact) {
+                    val alreadySelected = !eraser && !lasso && style.brush == type
+                    onBrush(type); onEraser(false)
+                    panel = if (alreadySelected && panel != "brush") "brush" else null
+                }
+                RealisticTool("eraser", "整笔橡皮", eraser && !lasso, Color(0xffd79489), compact) { onEraser(true); panel = null }
+                RealisticTool("lasso", "套索笔", lasso, Color(0xff799790), compact) { onLasso(); panel = null }
+                Box(Modifier.padding(top = 7.dp)) {
+                    ToolButton("chevron", "画笔颜色与粗细", panel == "brush") { panel = if (panel == "brush") null else "brush" }
+                }
             }
+            DoubleTapButton(doubleTapEnabled, onDoubleTapEnabled)
             Box(Modifier.glass()) { ToolButton("settings", "阅读设置与保存", panel == "settings") { panel = if (panel == "settings") null else "settings" } }
             Box(Modifier.glass()) { ToolButton("close", "返回沉浸阅读", false, onClose) }
         }
 
-        if (panel == "brush") Column(Modifier.align(Alignment.TopCenter).padding(top = 78.dp, start = 16.dp, end = 16.dp)
+        if (panel == "brush") Column(Modifier.align(Alignment.TopCenter).padding(top = 92.dp, start = 16.dp, end = 16.dp)
             .widthIn(max = 380.dp).fillMaxWidth().heightIn(max = panelHeight).glass(24)
             .verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
             Text("书写工具", color = ToolInk, style = MaterialTheme.typography.titleMedium)
             Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 BrushStyle.types.forEach { type ->
-                    FilterChip(selected = !eraser && style.brush == type, onClick = { onBrush(type); onEraser(false) }, label = { Text(brushName(type)) },
+                    FilterChip(selected = !eraser && !lasso && style.brush == type, onClick = { onBrush(type); onEraser(false) }, label = { Text(brushName(type)) },
                         colors = FilterChipDefaults.filterChipColors(selectedContainerColor = ToolInk.copy(alpha = .12f), selectedLabelColor = ToolInk, labelColor = ToolMuted))
                 }
             }
@@ -103,10 +118,9 @@ internal fun ReaderTools(
             }
             Text(if (style.brush == "highlighter") "半透明标记 · 同一笔交叉不加深" else if (style.brush == "pressure") "随手写笔压力变化的自然线条" else "稳定等宽 · 适合勾画与标注",
                 color = ToolMuted, style = MaterialTheme.typography.bodySmall)
-            TextButton(onClick = onClose, modifier = Modifier.align(Alignment.End)) { Text("开始书写", color = ToolInk) }
         }
 
-        if (panel == "settings") Column(Modifier.align(Alignment.TopEnd).padding(top = 78.dp, start = 16.dp, end = 16.dp)
+        if (panel == "settings") Column(Modifier.align(Alignment.TopEnd).padding(top = 92.dp, start = 16.dp, end = 16.dp)
             .widthIn(max = 360.dp).fillMaxWidth().heightIn(max = panelHeight).glass(24)
             .verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Text("阅读设置", color = ToolInk, style = MaterialTheme.typography.titleMedium)
@@ -175,7 +189,7 @@ private fun ColorButton(color: Int, selected: Boolean, onClick: () -> Unit) {
 
 @Composable
 private fun ToolButton(icon: String, label: String, selected: Boolean, onClick: () -> Unit) {
-    Box(Modifier.size(48.dp).clip(CircleShape).clickable(role = Role.Button, onClick = onClick)
+    Box(Modifier.size(40.dp).clip(CircleShape).clickable(role = Role.Button, onClick = onClick)
         .semantics { contentDescription = label; this.selected = selected }.padding(4.dp)
         .background(if (selected) ToolInk.copy(alpha = .11f) else Color.Transparent, CircleShape), contentAlignment = Alignment.Center) {
         Canvas(Modifier.size(24.dp)) {
@@ -187,6 +201,43 @@ private fun ToolButton(icon: String, label: String, selected: Boolean, onClick: 
                 "settings" -> { for (y in listOf(6f, 12f, 18f)) line(4f, y, 20f, y); for ((x, y) in listOf(9f to 6f, 15f to 12f, 8f to 18f)) { drawCircle(Color(0xfff5f6f5), 3.dp.toPx(), p(x, y)); drawCircle(ToolInk, 2.dp.toPx(), p(x, y), style = Stroke(1.5.dp.toPx())) } }
                 "eraser" -> { val path = Path().apply { moveTo(p(4f, 14f).x, p(4f, 14f).y); lineTo(p(13f, 4f).x, p(13f, 4f).y); lineTo(p(21f, 11f).x, p(21f, 11f).y); lineTo(p(12f, 21f).x, p(12f, 21f).y); lineTo(p(10f, 21f).x, p(10f, 21f).y); close() }; drawPath(path, ToolInk, style = Stroke(1.7.dp.toPx())); line(8f, 10f, 17f, 17f) }
                 else -> { line(7f, 16f, 16f, 5f); line(16f, 5f, 20f, 8f); line(20f, 8f, 11f, 19f); line(11f, 19f, 5f, 21f); line(5f, 21f, 7f, 16f); line(7f, 16f, 11f, 19f); if (icon == "highlighter") line(5f, 23f, 19f, 23f) }
+            }
+        }
+    }
+}
+
+/** Stylus with two tap waves; a slash and muted colour indicate disabled. */
+@Composable
+private fun DoubleTapButton(enabled: Boolean, onChange: (Boolean) -> Unit) {
+    Box(Modifier.size(40.dp).glass().toggleable(enabled, role = Role.Switch, onValueChange = onChange)
+        .semantics { contentDescription = "轻敲切换笔刷与橡皮"; stateDescription = if (enabled) "已开启" else "已关闭" }
+        .padding(4.dp).background(if (enabled) ToolInk.copy(alpha = .11f) else Color.Transparent, CircleShape),
+        contentAlignment = Alignment.Center) {
+        Canvas(Modifier.size(24.dp)) {
+            val ink = if (enabled) ToolInk else ToolMuted
+            fun p(x: Float, y: Float) = Offset(x * size.width / 24, y * size.height / 24)
+            fun line(x: Float, y: Float, x2: Float, y2: Float) =
+                drawLine(ink, p(x, y), p(x2, y2), 1.7.dp.toPx(), StrokeCap.Round)
+            val pen = Path().apply {
+                moveTo(p(4f, 20f).x, p(4f, 20f).y)
+                lineTo(p(6f, 14f).x, p(6f, 14f).y)
+                lineTo(p(15f, 5f).x, p(15f, 5f).y)
+                lineTo(p(19f, 9f).x, p(19f, 9f).y)
+                lineTo(p(10f, 18f).x, p(10f, 18f).y)
+                close()
+            }
+            drawPath(pen, ink, style = Stroke(1.7.dp.toPx()))
+            line(6f, 14f, 10f, 18f)
+            for (shift in listOf(0f, 4f)) {
+                val wave = Path().apply {
+                    moveTo(p(3f + shift, 3f).x, p(3f + shift, 3f).y)
+                    quadraticTo(p(6f + shift, 5f).x, p(6f + shift, 5f).y, p(6f + shift, 8f).x, p(6f + shift, 8f).y)
+                }
+                drawPath(wave, ink, style = Stroke(1.5.dp.toPx(), cap = StrokeCap.Round))
+            }
+            if (!enabled) {
+                drawLine(Color(0xfff1f3f2), p(3f, 3f), p(21f, 21f), 4.dp.toPx(), StrokeCap.Round)
+                line(3f, 3f, 21f, 21f)
             }
         }
     }

@@ -74,4 +74,22 @@ class AnnotationJournalTest {
         assertTrue("One small edit should not reserialize the large stroke: $bytes", bytes < 1024)
         assertEquals(10000, AnnotationJournal(file, "pdf").state.strokes.first().points.size)
     }
+
+    @Test fun readingOnlyEditsRecoverAndOldAcknowledgementDoesNotLoseNewPosition() = inDirectory { file ->
+        val journal = AnnotationJournal(file, "pdf")
+        journal.replace(listOf(stroke("a")), ReadingProgress(7, false))
+        val old = journal.state.revision
+        journal.replace(journal.state.strokes, ReadingProgress(19, true))
+        journal.acknowledge(old, "remote-old")
+        var restored = AnnotationJournal(file, "pdf")
+        assertEquals(ReadingProgress(19, true), restored.state.progress)
+        assertTrue(restored.state.dirty)
+        restored.compact()
+        restored = AnnotationJournal(file, "pdf")
+        assertEquals(ReadingProgress(19, true), restored.state.progress)
+        restored.importRemote(listOf(stroke("remote")), "remote-new", ReadingProgress(23, false))
+        restored = AnnotationJournal(file, "pdf")
+        assertEquals(ReadingProgress(23, false), restored.state.progress)
+        assertFalse(restored.state.dirty)
+    }
 }
