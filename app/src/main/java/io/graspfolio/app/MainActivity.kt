@@ -106,26 +106,8 @@ private fun GraspFolioApp(initialUri: Uri?) {
             documentPath = it.toString()
         }
     }
-    if (documentPath == null) WelcomeScreen { openPdf.launch(arrayOf("application/pdf")) }
+    if (documentPath == null) LibraryScreen(onOpen = { openPdf.launch(arrayOf("application/pdf")) }, onRead = { documentPath = it.toString() })
     else PdfReader(Uri.parse(documentPath!!), onOpenAnother = { openPdf.launch(arrayOf("application/pdf")) }, onExit = { documentPath = null })
-}
-
-@Composable
-private fun WelcomeScreen(onOpen: () -> Unit) = Box(
-    Modifier.fillMaxSize().background(Paper).safeDrawingPadding(), contentAlignment = Alignment.Center
-) {
-    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(32.dp)) {
-        Text("GraspFolio", style = MaterialTheme.typography.displaySmall, fontWeight = FontWeight.SemiBold, color = Ink)
-        Text("掌页", style = MaterialTheme.typography.titleLarge, color = MutedInk)
-        Spacer(Modifier.height(18.dp))
-        Text("握住书页，自在阅读。", style = MaterialTheme.typography.titleMedium, color = Ink)
-        Spacer(Modifier.height(8.dp))
-        Text("手指负责握住书。书角负责翻页。", color = MutedInk, textAlign = TextAlign.Center)
-        Spacer(Modifier.height(36.dp))
-        Button(onClick = onOpen, colors = ButtonDefaults.buttonColors(containerColor = Ink), contentPadding = PaddingValues(horizontal = 22.dp, vertical = 14.dp)) {
-            Text("打开本地 PDF")
-        }
-    }
 }
 
 @Composable
@@ -147,7 +129,7 @@ private fun PdfReader(uri: Uri, onOpenAnother: () -> Unit, onExit: () -> Unit) {
     var lasso by rememberSaveable { mutableStateOf(false) }
     var eraser by rememberSaveable { mutableStateOf(false) }
     val penSettings = remember { context.getSharedPreferences("pen_settings", Context.MODE_PRIVATE) }
-    var brushStyle by remember { mutableStateOf(penSettings.loadBrush()) }
+    var brushStyle by remember { mutableStateOf(penSettings.loadBrush().let { if (it.brush == "fineliner") it.copy(brush = "pressure") else it }) }
     val selectStyle: (BrushStyle) -> Unit = { brushStyle = it; penSettings.saveBrush(it) }
     var doubleTapEnabled by rememberSaveable { mutableStateOf(penSettings.getBoolean("double_tap_enabled", true)) }
     var writingVibration by rememberSaveable { mutableStateOf(penSettings.getBoolean("writing_vibration", true)) }
@@ -235,7 +217,7 @@ private fun PdfReader(uri: Uri, onOpenAnother: () -> Unit, onExit: () -> Unit) {
                     onContinuousMove = { holdPosition = it },
                     onContinuousEnd = { holdOrigin = null; holdPosition = null; holdDirection = 0 }
                 )) {
-                BoxWithConstraints(Modifier.fillMaxSize()) {
+                BoxWithConstraints(Modifier.fillMaxSize().glassSource().background(Paper)) {
                     val targetWidth = with(LocalDensity.current) { maxWidth.roundToPx() }.coerceAtLeast(1)
                     LaunchedEffect(targetWidth) { renderWidth = targetWidth }
                     bitmap?.let { Image(it.asImageBitmap(), "PDF 第 ${page + 1} 页", Modifier.fillMaxSize(), contentScale = ContentScale.Fit) }
@@ -402,7 +384,7 @@ private suspend fun PointerInputScope.cornerNavigation(cornerScale: Float, pageB
 }
 
 @Composable
-private fun PageNumber(page: String, pageCount: Int, modifier: Modifier = Modifier) = Text("$page / $pageCount", color = MutedInk, style = MaterialTheme.typography.labelMedium, modifier = modifier.clip(RoundedCornerShape(16.dp)).background(Color.White.copy(alpha = .72f)).padding(horizontal = 10.dp, vertical = 5.dp))
+private fun PageNumber(page: String, pageCount: Int, modifier: Modifier = Modifier) = Text("$page / $pageCount", color = MutedInk, style = MaterialTheme.typography.labelMedium, modifier = modifier.liquidGlass(16).padding(horizontal = 10.dp, vertical = 5.dp))
 
 @Composable
 private fun ContinuousTurnIndicator(origin: Offset, position: Offset, direction: Int) = Canvas(Modifier.fillMaxSize()) {
@@ -421,8 +403,8 @@ private fun ContinuousTurnIndicator(origin: Offset, position: Offset, direction:
     drawCircle(Ink.copy(alpha = .75f), 5.dp.toPx(), thumb)
 }
 
-@Composable private fun LoadingScreen() = Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("正在打开书页…", color = MutedInk) }
-@Composable private fun ErrorScreen(message: String, onOpenAnother: () -> Unit) = Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(32.dp)) { Text(message, color = Ink, textAlign = TextAlign.Center); Spacer(Modifier.height(18.dp)); Button(onClick = onOpenAnother) { Text("选择其他 PDF") } } }
+@Composable private fun LoadingScreen() = Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { LeatherBackground(); Text("正在打开书页…", color = MutedInk, modifier = Modifier.liquidGlass().padding(24.dp)) }
+@Composable private fun ErrorScreen(message: String, onOpenAnother: () -> Unit) = Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { LeatherBackground(); Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(32.dp).liquidGlass().padding(24.dp)) { Text(message, color = Ink, textAlign = TextAlign.Center); Spacer(Modifier.height(18.dp)); GlassAction("选择其他 PDF", onOpenAnother) } }
 
 private fun vibrate(context: Context) {
     val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) (context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator else @Suppress("DEPRECATION") (context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator)
@@ -468,6 +450,6 @@ private class PdfDocument(context: Context, uri: Uri) : AutoCloseable {
     override fun close() { renderer.close(); descriptor.close() }
 }
 
-private val Paper = Color(0xFFF8F4EC)
-private val Ink = Color(0xFF22201D)
-private val MutedInk = Color(0xFF716C65)
+private val Paper = GlassPaper
+private val Ink = GlassInk
+private val MutedInk = GlassMuted

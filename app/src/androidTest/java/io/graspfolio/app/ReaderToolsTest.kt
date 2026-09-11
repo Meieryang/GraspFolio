@@ -53,7 +53,7 @@ class ReaderToolsTest {
         }
         compose.onNodeWithContentDescription("返回沉浸阅读").assertIsDisplayed()
         capture("toolbar")
-        compose.onNodeWithContentDescription("画笔颜色与粗细").performClick()
+        compose.onNodeWithContentDescription("压感笔").performClick()
         compose.onNodeWithText("荧光笔").performClick()
         compose.onNodeWithContentDescription("暖黄").performClick()
         compose.runOnIdle { assertEquals("highlighter", style.brush); assertEquals(0xfff1ce58.toInt(), style.color); assertFalse(eraser) }

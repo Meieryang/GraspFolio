@@ -37,6 +37,7 @@ android {
 }
 
 dependencies {
+    implementation("io.github.kyant0:backdrop:1.0.6")
     implementation("androidx.graphics:graphics-core:1.0.4")
     implementation("vivo:penengine-simplify:1.0.0.10")
     implementation(platform(libs.androidx.compose.bom))

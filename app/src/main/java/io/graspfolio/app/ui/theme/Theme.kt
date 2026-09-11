@@ -1,6 +1,5 @@
 package io.graspfolio.app.ui.theme
 
-import android.app.Activity
 import android.os.Build
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.MaterialTheme
@@ -18,19 +17,18 @@ private val DarkColorScheme = darkColorScheme(
 )
 
 private val LightColorScheme = lightColorScheme(
-    primary = Purple40,
-    secondary = PurpleGrey40,
-    tertiary = Pink40
+    primary = androidx.compose.ui.graphics.Color(0xff567896),
+    secondary = androidx.compose.ui.graphics.Color(0xff173d58),
+    tertiary = androidx.compose.ui.graphics.Color(0xffc57968),
+    background = androidx.compose.ui.graphics.Color(0xfff5eee4),
+    surface = androidx.compose.ui.graphics.Color(0xfffffaf3),
+    onSurface = androidx.compose.ui.graphics.Color(0xff173d58),
+    onSurfaceVariant = androidx.compose.ui.graphics.Color(0xff687f90),
+    surfaceVariant = androidx.compose.ui.graphics.Color(0xffe9e5dd),
+    outline = androidx.compose.ui.graphics.Color(0xffa2afb5),
+    secondaryContainer = androidx.compose.ui.graphics.Color(0xffdce5e9)
 
-    /* Other default colors to override
-    background = Color(0xFFFFFBFE),
-    surface = Color(0xFFFFFBFE),
-    onPrimary = Color.White,
-    onSecondary = Color.White,
-    onTertiary = Color.White,
-    onBackground = Color(0xFF1C1B1F),
-    onSurface = Color(0xFF1C1B1F),
-    */
+
 )
 
 @Composable
@@ -53,6 +51,6 @@ fun GraspFolioTheme(
     MaterialTheme(
         colorScheme = colorScheme,
         typography = Typography,
-        content = content
+        content = { io.graspfolio.app.GlassEnvironment(content) }
     )
 }

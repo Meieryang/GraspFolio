@@ -20,6 +20,7 @@ import io.graspfolio.app.ui.theme.GraspFolioTheme
 class ReaderToolsPreviewActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        val narrow = intent.getBooleanExtra("narrow", false)
         val landscape = intent.getBooleanExtra("landscape", false)
         requestedOrientation = if (landscape) ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE else ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
         val panel = intent.getStringExtra("panel")?.takeIf { it == "brush" || it == "settings" }
@@ -27,13 +28,13 @@ class ReaderToolsPreviewActivity : ComponentActivity() {
         setContent {
             GraspFolioTheme(darkTheme = false, dynamicColor = false) {
                 ImmersiveReading()
-                var style by remember { mutableStateOf(BrushStyle("highlighter", 0xfff1ce58.toInt(), 12f)) }
+                var style by remember { mutableStateOf(BrushStyle()) }
                 var doubleTapEnabled by remember { mutableStateOf(true) }
                 var lasso by remember { mutableStateOf(false) }
                 var eraser by remember { mutableStateOf(false) }
                 var page by remember { mutableIntStateOf(5) }
-                Box(Modifier.fillMaxSize().background(Color(0xfff8f4ec))) {
-                    Row(Modifier.fillMaxSize().padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+                Box(Modifier.widthIn(max = if (narrow) 360.dp else androidx.compose.ui.unit.Dp.Infinity).fillMaxSize().background(Color(0xfff8f4ec))) {
+                    Row(Modifier.fillMaxSize().glassSource().padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(2.dp)) {
                         repeat(if (landscape) 2 else 1) { index ->
                             Column(Modifier.weight(1f).fillMaxHeight().background(Color.White).padding(44.dp), verticalArrangement = Arrangement.spacedBy(22.dp)) {
                                 Spacer(Modifier.height(60.dp))

@@ -34,19 +34,15 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import kotlin.math.roundToInt
 
-private val ToolInk = Color(0xff3c5368)
-private val ToolMuted = Color(0xff778591)
+private val ToolInk = GlassInk
+private val ToolMuted = GlassMuted
 private val Swatches = listOf(0xff111111.toInt(), 0xff567896.toInt(), 0xffc57968.toInt(),
     0xfff1ce58.toInt(), 0xff83b09a.toInt(), 0xffa994c1.toInt())
+private val OfferedBrushes = listOf("pressure", "highlighter")
 internal fun brushName(brush: String) = when (brush) { "fineliner" -> "等宽笔"; "highlighter" -> "荧光笔"; else -> "压感笔" }
 
-/** A lightweight glass-like surface, without a full-screen blur pass over the PDF/ink. */
-private fun Modifier.glass(radius: Int = 30): Modifier {
-    val shape = RoundedCornerShape(radius.dp)
-    return shadow(10.dp, shape, ambientColor = ToolInk.copy(alpha = .12f), spotColor = ToolInk.copy(alpha = .16f))
-        .clip(shape).background(Brush.verticalGradient(listOf(Color(0xf5fffefa), Color(0xdce9edf0))))
-        .border(1.dp, Brush.verticalGradient(listOf(Color.White, Color.White.copy(alpha = .4f))), shape)
-}
+@Composable
+private fun Modifier.glass(radius: Int = 30): Modifier = liquidGlass(radius, if (radius == 24) .60f else .24f)
 
 @Composable
 internal fun ReaderTools(
@@ -72,19 +68,27 @@ internal fun ReaderTools(
         val compact = maxWidth < 420.dp
         val panelHeight = minOf(maxHeight * .7f, (maxHeight - 160.dp).coerceAtLeast(96.dp))
         Row(Modifier.align(Alignment.TopCenter).padding(top = 16.dp, start = if (compact) 8.dp else 12.dp, end = if (compact) 8.dp else 12.dp),
-            horizontalArrangement = Arrangement.spacedBy(if (compact) 6.dp else 10.dp), verticalAlignment = Alignment.CenterVertically) {
-            Row(Modifier.glass(18).padding(horizontal = 2.dp), verticalAlignment = Alignment.Top) {
-                for (type in BrushStyle.types) RealisticTool(type, brushName(type), !eraser && !lasso && style.brush == type,
-                    if (type == style.brush) Color(style.opaqueColor) else if (type == "highlighter") Color(0xffebc751) else ToolInk,
-                    compact) {
-                    val alreadySelected = !eraser && !lasso && style.brush == type
-                    onBrush(type); onEraser(false)
-                    panel = if (alreadySelected && panel != "brush") "brush" else null
-                }
-                RealisticTool("eraser", "整笔橡皮", eraser && !lasso, Color(0xffd79489), compact) { onEraser(true); panel = null }
-                RealisticTool("lasso", "套索笔", lasso, Color(0xff799790), compact) { onLasso(); panel = null }
-                Box(Modifier.padding(top = 7.dp)) {
-                    ToolButton("chevron", "画笔颜色与粗细", panel == "brush") { panel = if (panel == "brush") null else "brush" }
+            horizontalArrangement = Arrangement.spacedBy(if (compact) 8.dp else 10.dp), verticalAlignment = Alignment.Top) {
+            Box {
+                // Separate the tray surface from its contents so the tips are not clipped.
+                Box(Modifier.matchParentSize().padding(bottom = 18.dp).glass(22))
+                Row(Modifier.padding(horizontal = 4.dp), verticalAlignment = Alignment.Top) {
+                    for (type in OfferedBrushes) RealisticTool(type, brushName(type), !eraser && !lasso && style.brush == type,
+                        if (type == style.brush) Color(style.opaqueColor) else if (type == "highlighter") Color(Swatches[3]) else Color(Swatches[0]),
+                        compact) {
+                        val alreadySelected = !eraser && !lasso && style.brush == type
+                        onBrush(type); onEraser(false)
+                        panel = if (alreadySelected && panel != "brush") "brush" else null
+                    }
+                    RealisticTool("eraser", "整笔橡皮", eraser && !lasso, Color(0xffd79489), compact) { onEraser(true); panel = null }
+                    RealisticTool("lasso", "套索笔", lasso, Color(0xff799790), compact) { onLasso(); panel = null }
+                    Row(Modifier.height(40.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Swatches.take(3).forEach { color ->
+                            QuickColorButton(color, style.color == color && !eraser && !lasso, compact) {
+                                onStyle(style.copy(color = color)); onEraser(false)
+                            }
+                        }
+                    }
                 }
             }
             DoubleTapButton(doubleTapEnabled, onDoubleTapEnabled)
@@ -92,12 +96,12 @@ internal fun ReaderTools(
             Box(Modifier.glass()) { ToolButton("close", "返回沉浸阅读", false, onClose) }
         }
 
-        if (panel == "brush") Column(Modifier.align(Alignment.TopCenter).padding(top = 92.dp, start = 16.dp, end = 16.dp)
+        if (panel == "brush") Column(Modifier.align(Alignment.TopCenter).padding(top = 84.dp, start = 16.dp, end = 16.dp)
             .widthIn(max = 380.dp).fillMaxWidth().heightIn(max = panelHeight).glass(24)
             .verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
             Text("书写工具", color = ToolInk, style = MaterialTheme.typography.titleMedium)
             Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                BrushStyle.types.forEach { type ->
+                OfferedBrushes.forEach { type ->
                     FilterChip(selected = !eraser && !lasso && style.brush == type, onClick = { onBrush(type); onEraser(false) }, label = { Text(brushName(type)) },
                         colors = FilterChipDefaults.filterChipColors(selectedContainerColor = ToolInk.copy(alpha = .12f), selectedLabelColor = ToolInk, labelColor = ToolMuted))
                 }
@@ -120,7 +124,7 @@ internal fun ReaderTools(
                 color = ToolMuted, style = MaterialTheme.typography.bodySmall)
         }
 
-        if (panel == "settings") Column(Modifier.align(Alignment.TopEnd).padding(top = 92.dp, start = 16.dp, end = 16.dp)
+        if (panel == "settings") Column(Modifier.align(Alignment.TopEnd).padding(top = 84.dp, start = 16.dp, end = 16.dp)
             .widthIn(max = 360.dp).fillMaxWidth().heightIn(max = panelHeight).glass(24)
             .verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Text("阅读设置", color = ToolInk, style = MaterialTheme.typography.titleMedium)
@@ -131,12 +135,12 @@ internal fun ReaderTools(
             HorizontalDivider(color = ToolMuted.copy(alpha = .15f))
             Text("批注保存", color = ToolInk, fontWeight = FontWeight.Medium)
             Text(saveStatus, color = ToolMuted, style = MaterialTheme.typography.bodySmall)
-            TextButton(onClick = onAuthorize) { Text("授权 PDF 所在目录", color = ToolInk) }
-            TextButton(onClick = onRetry) { Text("重试同步", color = ToolInk) }
+            TextButton(onClick = onAuthorize, modifier = Modifier.liquidGlass(18)) { Text("授权 PDF 所在目录", color = ToolInk) }
+            TextButton(onClick = onRetry, modifier = Modifier.liquidGlass(18)) { Text("重试同步", color = ToolInk) }
             var details by remember { mutableStateOf(false) }
             TextButton(onClick = { details = !details }) { Text(if (details) "收起书写诊断" else "书写诊断", color = ToolInk) }
             if (details) Text(diagnostics + "\n荧光笔使用单次透明合成，避免抬笔变深。", color = ToolMuted, style = MaterialTheme.typography.labelSmall)
-            TextButton(onClick = onExit) { Text("退出阅读", color = ToolInk) }
+            TextButton(onClick = onExit, modifier = Modifier.liquidGlass(18)) { Text("退出阅读", color = ToolInk) }
         }
 
         if (pageCount > 0) {
@@ -157,7 +161,7 @@ internal fun ReaderTools(
 private fun SlimSlider(value: Float, onValueChange: (Float) -> Unit, valueRange: ClosedFloatingPointRange<Float>,
     modifier: Modifier = Modifier, onValueChangeFinished: () -> Unit = {}, enabled: Boolean = true) {
     Slider(value, onValueChange, modifier, enabled = enabled, valueRange = valueRange, onValueChangeFinished = onValueChangeFinished,
-        thumb = { Box(Modifier.size(16.dp).shadow(2.dp, CircleShape).background(if (enabled) ToolInk else ToolMuted, CircleShape)) },
+        thumb = { Box(Modifier.size(18.dp).liquidGlass(9).padding(3.dp).background(if (enabled) Color(0xff567896) else ToolMuted, CircleShape)) },
         track = {
             Canvas(Modifier.fillMaxWidth().height(4.dp)) {
                 val end = Offset(size.width, size.height / 2)
@@ -173,7 +177,7 @@ private fun SlimSlider(value: Float, onValueChange: (Float) -> Unit, valueRange:
 private fun SettingSwitch(label: String, checked: Boolean, onClick: () -> Unit) {
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
         Text(label, color = ToolInk, style = MaterialTheme.typography.bodyMedium)
-        Switch(checked, { onClick() }, modifier = Modifier.semantics { contentDescription = label }, colors = SwitchDefaults.colors(checkedTrackColor = ToolInk))
+        GlassToggle(label, checked) { onClick() }
     }
 }
 
@@ -240,5 +244,16 @@ private fun DoubleTapButton(enabled: Boolean, onChange: (Boolean) -> Unit) {
                 line(3f, 3f, 21f, 21f)
             }
         }
+    }
+}
+
+/** The quick palette uses the existing exact swatches, with no rings or plus button. */
+@Composable
+private fun QuickColorButton(color: Int, selected: Boolean, compact: Boolean, onClick: () -> Unit) {
+    val label = when (color) { Swatches[0] -> "墨黑"; Swatches[1] -> "雾蓝"; else -> "陶粉" }
+    Box(Modifier.width(if (compact) 24.dp else 32.dp).height(40.dp)
+        .clickable(role = Role.RadioButton, onClick = onClick)
+        .semantics { contentDescription = label; this.selected = selected }, contentAlignment = Alignment.Center) {
+        Box(Modifier.size(if (selected) 20.dp else 18.dp).background(Color(color), CircleShape))
     }
 }
