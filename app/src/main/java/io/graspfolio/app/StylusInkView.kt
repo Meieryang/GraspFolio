@@ -98,10 +98,11 @@ internal class StylusInkView(context: Context) : FrameLayout(context), DefaultLi
     private val activity = generateSequence(context) { (it as? ContextWrapper)?.baseContext }.filterIsInstance<Activity>().first()
     private val owner = activity as LifecycleOwner
     private var foreground = false
-    private val doubleTapSwitch = DoubleTapSwitch()
-    var doubleTapEnabled: Boolean
-        get() = doubleTapSwitch.enabled
-        set(value) { doubleTapSwitch.enabled = value }
+    private val doubleTapSwitch = (activity as? MainActivity)?.hoverSwitch ?: DoubleTapSwitch().apply { enabled = false }
+    override fun dispatchHoverEvent(event: MotionEvent): Boolean {
+        if (activity !is MainActivity) doubleTapSwitch.observeStylus(event)
+        return super.dispatchHoverEvent(event)
+    }
     private val sdk = VivoPenAdapter(activity) {
         doubleTapSwitch.dispatch(
             canToggle = { foreground && enabledForWriting && active == null },
@@ -147,6 +148,7 @@ internal class StylusInkView(context: Context) : FrameLayout(context), DefaultLi
         owner.lifecycle.addObserver(this)
     }
     override fun onDetachedFromWindow() {
+        doubleTapSwitch.enabled = false
         cancelStroke(); clearLassoPreview()
         if (Build.VERSION.SDK_INT >= 29) front?.let { it.close(); removeView(it.view) }
         front = null
@@ -154,7 +156,7 @@ internal class StylusInkView(context: Context) : FrameLayout(context), DefaultLi
     }
     override fun onInterceptTouchEvent(event: MotionEvent) = true
     override fun onResume(owner: LifecycleOwner) { foreground = true; sdk.start() }
-    override fun onPause(owner: LifecycleOwner) { foreground = false; cancelStroke(); resetFront(); sdk.stop() }
+    override fun onPause(owner: LifecycleOwner) { foreground = false; doubleTapSwitch.enabled = false; cancelStroke(); resetFront(); sdk.stop() }
     fun cancelStroke() {
         stopLassoWork()
         if (Build.VERSION.SDK_INT >= 29) front?.cancelActive()
@@ -169,6 +171,7 @@ internal class StylusInkView(context: Context) : FrameLayout(context), DefaultLi
         sdk.vibrate(false); onContact(false); invalidate()
     }
     override fun onTouchEvent(event: MotionEvent): Boolean {
+        doubleTapSwitch.observeStylus(event)
         val actionIndex = event.actionIndex
         if ((event.actionMasked == MotionEvent.ACTION_DOWN || event.actionMasked == MotionEvent.ACTION_POINTER_DOWN) &&
             placements.any { it.contains(event.getX(actionIndex), event.getY(actionIndex)) }) onPageContact()

@@ -1,5 +1,7 @@
 package io.graspfolio.app
 
+internal const val PageCornerSizeDp = 69f
+
 /** Physical PDF indices; a null slot is the blank facing a cover or final page. */
 internal fun readingPages(page: Int, count: Int, spread: Boolean, cover: Boolean): List<Int?> {
     require(count > 0)

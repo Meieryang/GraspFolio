@@ -24,7 +24,7 @@ import androidx.compose.ui.unit.dp
 /** White instruments with soft cylindrical shading; tips extend below the separate tray surface. */
 @Composable
 internal fun RealisticTool(type: String, label: String, selected: Boolean, color: Color, compact: Boolean, onClick: () -> Unit) {
-    val extension by animateDpAsState(if (selected) 5.dp else 0.dp, label = "tool extension")
+    val extension by animateDpAsState(if (selected) 5.dp else (-7).dp, label = "tool extension")
     Canvas(Modifier.width(if (compact) 30.dp else 40.dp).height(58.dp)
         .glassClickable(role = Role.RadioButton, onClick = onClick)
         .semantics { contentDescription = label; this.selected = selected }) {

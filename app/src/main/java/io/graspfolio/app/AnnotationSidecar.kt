@@ -17,8 +17,9 @@ internal class SafAnnotationBackend(private val context: Context, private val ur
     override fun openJournal(): AnnotationJournal {
         val identity = pdfDigest(context, uri)
         val dir = File(context.filesDir, "annotations").apply { check(exists() || mkdirs()) }
-        sidecar = AnnotationSidecar(context, uri, identity)
-        return AnnotationJournal(File(dir, inkDigest(uri.toString().toByteArray()) + ".json"), identity)
+        val journalFile = File(dir, inkDigest(uri.toString().toByteArray()) + ".json")
+        sidecar = AnnotationSidecar(context, uri, identity, File(dir, journalFile.name + ".pages"))
+        return AnnotationJournal(journalFile, identity, pruneOnOpen = true)
     }
     override fun sync(folder: Uri, snapshot: DurableInk, allowLoad: Boolean) = sidecar.sync(folder, snapshot, allowLoad)
 }
@@ -36,10 +37,12 @@ internal fun pdfDigest(context: Context, target: Uri): String {
 }
 
 internal data class SidecarResult(val hash: String, val imported: List<InkStroke>? = null,
-    val progress: ReadingProgress? = null, val acknowledgedRevision: Long? = null)
+    val progress: ReadingProgress? = null, val acknowledgedRevision: Long? = null, val audio: List<AudioNote> = emptyList())
 
 /** Only the external-sync thread accesses this object. No access to mutable local-writer state. */
-internal class AnnotationSidecar(private val context: Context, private val uri: Uri, private val identity: String) {
+internal class AnnotationSidecar(private val context: Context, private val uri: Uri, private val identity: String,
+    private val blobs: File = File(context.filesDir, "sidecar-imports/$identity")) {
+    private val audioAssets = AudioAssets(context)
     private var validatedFolder: Uri? = null
     private var validatedPdfStamp: String? = null
     fun sync(folder: Uri, snapshot: DurableInk, allowLoad: Boolean): SidecarResult {
@@ -69,18 +72,29 @@ internal class AnnotationSidecar(private val context: Context, private val uri: 
         transaction.recover(snapshot.base, snapshot.revision, snapshot.syncedRevision)?.let {
             return SidecarResult(it.hash, acknowledgedRevision = it.revision)
         }
-        val remote = files.read(sideName)
-        val remoteHash = remote?.let(::inkDigest)
-        if (shouldLoadRemote(snapshot.base, remoteHash, snapshot.dirty)) {
+        val remoteHash = files.open(sideName)?.use(::streamInkDigest)
+        if (shouldLoadRemote(snapshot.base, remoteHash, !snapshot.canImportRemote)) {
             require(allowLoad) { "旁文件已变化，请通过菜单重试同步以载入" }
-            val document = InkCodec.decodeDocument(remote!!.toString(Charsets.UTF_8), identity)
-            return SidecarResult(remoteHash!!, document.strokes, document.progress)
+            val document = files.open(sideName)!!.use { input ->
+                val digest = java.security.MessageDigest.getInstance("SHA-256")
+                val decoded = android.util.JsonReader(java.security.DigestInputStream(input, digest).reader().buffered()).use { reader ->
+                    StreamingInk.read(reader, identity, blobs).also { require(reader.peek() == android.util.JsonToken.END_DOCUMENT) }
+                }
+                require(digest.digest().joinToString("") { "%02x".format(it) } == remoteHash) { "旁文件在载入期间发生变化，请重试" }
+                decoded
+            }
+            audioAssets.download(folder, document.audio)
+            return SidecarResult(remoteHash!!, document.strokes, document.progress, audio = document.audio)
         }
-        if (!snapshot.dirty && remote != null) return SidecarResult(remoteHash!!)
-        val content = InkPerformance.measure("sidecar_encode") {
-            InkCodec.encodeDocument(identity, snapshot.strokes, snapshot.progress ?: ReadingProgress()).toByteArray()
+        if (!snapshot.dirty && remoteHash != null) { audioAssets.download(folder, snapshot.audio); return SidecarResult(remoteHash!!) }
+        audioAssets.upload(folder, snapshot.audio)
+        val content = File.createTempFile("ink-sync-", ".json", context.cacheDir)
+        return try {
+            InkPerformance.measure("sidecar_encode") {
+                content.bufferedWriter().use { StreamingInk.write(it, identity, snapshot.strokes, snapshot.progress ?: ReadingProgress(), snapshot.audio) }
+            }
+            SidecarResult(transaction.write(remoteHash, content, snapshot.revision))
         }
-        return try { SidecarResult(transaction.write(remoteHash, content, snapshot.revision)) }
         catch (failure: Exception) {
             // If the provider is still accessible, restore the old name immediately. A process
             // death follows the same recovery path on the next open/retry instead.
@@ -90,7 +104,7 @@ internal class AnnotationSidecar(private val context: Context, private val uri: 
                 }
             } catch (recoveryFailure: Exception) { failure.addSuppressed(recoveryFailure) }
             throw failure
-        }
+        } finally { content.delete() }
     }
 }
 
@@ -105,6 +119,14 @@ internal class SafSidecarFiles(private val context: Context, private val folder:
         } ?: error("无法读取保存目录")
         require(found.size <= 1) { "目录中有多个同名文件：$name" }
         return found.singleOrNull()
+    }
+    override fun open(name: String): java.io.InputStream? = find(name)?.let { target ->
+        resolver.openInputStream(target) ?: error("无法读取保存文件")
+    }
+    override fun createFrom(name: String, input: java.io.InputStream) {
+        require(find(name) == null) { "保存临时文件已存在" }
+        val target = DC.createDocument(resolver, parent, "application/octet-stream", name) ?: error("无法创建保存临时文件")
+        resolver.openOutputStream(target, "w")?.use { input.copyTo(it, 65536) } ?: error("无法写入保存临时文件")
     }
     override fun read(name: String): ByteArray? = find(name)?.let { target ->
         resolver.openInputStream(target)?.use { it.readBytes() } ?: error("无法读取保存文件")

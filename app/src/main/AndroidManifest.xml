@@ -3,6 +3,7 @@
     xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.VIBRATE" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <!-- SDK 1.0.0.10 no longer requests QUERY_ALL_PACKAGES; keep visibility scoped. -->
     <queries>
         <package android:name="com.vivo.penalgoengine" />

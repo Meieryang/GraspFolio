@@ -19,7 +19,7 @@ class GlassFeedbackTest {
         automation.waitForIdle(500, 5000)
         fun find(node: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
             if (node == null) return null
-            if (node.contentDescription?.toString() == "轻敲切换笔刷与橡皮") return node
+            if (node.contentDescription?.toString() == "阅读设置与保存") return node
             for (i in 0 until node.childCount) find(node.getChild(i))?.let { return it }
             return null
         }

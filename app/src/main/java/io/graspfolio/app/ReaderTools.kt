@@ -31,6 +31,7 @@ import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import kotlin.math.roundToInt
 
@@ -55,9 +56,9 @@ internal fun ReaderTools(
     initialPanel: String? = null,
     dismissBrushRequest: Int = 0,
     lasso: Boolean = false, onLasso: () -> Unit = {},
-    doubleTapEnabled: Boolean = true, onDoubleTapEnabled: (Boolean) -> Unit = {},
     immersiveBar: Boolean = false,
-    brushColor: (String) -> Int = { if (it == "highlighter") Swatches[3] else Swatches[0] }
+    brushColor: (String) -> Int = { if (it == "highlighter") Swatches[3] else Swatches[0] },
+    audioUi: ReaderAudioUi? = null
 ) {
     var panel by rememberSaveable { mutableStateOf(initialPanel) }
     var lastDismissRequest by remember { mutableIntStateOf(dismissBrushRequest) }
@@ -65,11 +66,19 @@ internal fun ReaderTools(
         if (lastDismissRequest != dismissBrushRequest && panel == "brush") panel = null
         lastDismissRequest = dismissBrushRequest
     }
+    LaunchedEffect(audioUi?.interactionVersion) { if (audioUi != null) panel = null }
+    LaunchedEffect(panel) { if (panel != null) audioUi?.collapse?.invoke() }
     BackHandler(enabled = panel != null) { panel = null }
     BoxWithConstraints(Modifier.fillMaxSize()) {
+        val availableWidth = maxWidth
         val compact = maxWidth < 420.dp
+        val audioOnOwnRow = audioUi != null && maxWidth < 700.dp
+        val audioOffset = if (audioOnOwnRow) 56.dp else 0.dp
+        if (audioUi != null) Box(Modifier.align(Alignment.TopStart).padding(top = 16.dp, start = 16.dp, end = 16.dp)) {
+            audioUi.entries(if (audioOnOwnRow) availableWidth - 32.dp else ((availableWidth - 440.dp) / 2 - 24.dp).coerceIn(48.dp, 200.dp))
+        }
         val panelHeight = minOf(maxHeight * .7f, (maxHeight - 160.dp).coerceAtLeast(96.dp))
-        Row(Modifier.align(Alignment.TopCenter).padding(top = if (immersiveBar) 0.dp else 16.dp, start = if (compact) 8.dp else 12.dp, end = if (compact) 8.dp else 12.dp),
+        Row(Modifier.align(Alignment.TopCenter).padding(top = if (immersiveBar) 0.dp else 16.dp + audioOffset, start = if (compact) 8.dp else 12.dp, end = if (compact) 8.dp else 12.dp),
             horizontalArrangement = Arrangement.spacedBy(if (compact) 8.dp else 10.dp), verticalAlignment = Alignment.Top) {
             Box {
                 // Separate the tray surface from its contents so the tips are not clipped.
@@ -94,23 +103,18 @@ internal fun ReaderTools(
                 }
             }
             if (!immersiveBar) {
-            DoubleTapButton(doubleTapEnabled, onDoubleTapEnabled)
             Box(Modifier.glass()) { ToolButton("settings", "阅读设置与保存", panel == "settings") { panel = if (panel == "settings") null else "settings" } }
             }
             Box(Modifier.glass()) { ToolButton(if (immersiveBar) "close" else "exit", if (immersiveBar) "关闭沉浸画笔栏" else "退出阅读", false, if (immersiveBar) onClose else onExit) }
         }
 
-        if (panel == "brush") Column(Modifier.align(Alignment.TopCenter).padding(top = if (immersiveBar) 68.dp else 84.dp, start = 16.dp, end = 16.dp)
-            .widthIn(max = 380.dp).fillMaxWidth().heightIn(max = panelHeight).glass(24)
-            .verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
-            Text("书写工具", color = ToolInk, style = MaterialTheme.typography.titleMedium)
-            Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OfferedBrushes.forEach { type ->
-                    FilterChip(selected = !eraser && !lasso && style.brush == type, onClick = { onBrush(type); onEraser(false) }, label = { Text(brushName(type)) },
-                        colors = FilterChipDefaults.filterChipColors(selectedContainerColor = ToolInk.copy(alpha = .12f), selectedLabelColor = ToolInk, labelColor = ToolMuted))
-                }
-            }
-            Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.SpaceBetween) {
+        if (audioUi != null && panel == null) Box(Modifier.align(Alignment.TopStart).padding(top = 76.dp + audioOffset, start = 16.dp, end = 16.dp)) {
+            audioUi.controls()
+        }
+        if (panel == "brush") Column(Modifier.align(Alignment.TopCenter).padding(top = if (immersiveBar) 68.dp else 84.dp + audioOffset, start = 16.dp, end = 16.dp)
+            .widthIn(max = 272.dp).fillMaxWidth().heightIn(max = panelHeight).glass(24)
+            .verticalScroll(rememberScrollState()).padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
                 Swatches.forEach { color -> ColorButton(color, style.color == color) { onStyle(style.copy(color = color)); onEraser(false) } }
             }
             val range = if (style.brush == "highlighter") 6f..32f else .5f..8f
@@ -118,17 +122,10 @@ internal fun ReaderTools(
             SlimSlider(value = style.width.coerceIn(range), onValueChange = { onStyle(style.copy(width = it)); onEraser(false) },
                 valueRange = range, modifier = Modifier.semantics { contentDescription = "画笔粗细（PDF 点）" },
             )
-            Canvas(Modifier.fillMaxWidth().height(52.dp).clip(RoundedCornerShape(14.dp)).background(Color.White.copy(alpha = .65f))) {
-                val color = Color(style.opaqueColor).copy(alpha = style.alpha / 255f)
-                // One path gives the translucent preview one opacity, including joins.
-                val path = Path().apply { moveTo(size.width * .1f, size.height * .65f); cubicTo(size.width * .35f, -size.height * .1f, size.width * .6f, size.height * 1.1f, size.width * .9f, size.height * .35f) }
-                drawPath(path, color, style = Stroke(width = style.width.dp.toPx().coerceAtMost(size.height * .7f), cap = StrokeCap.Round))
-            }
-            Text(if (style.brush == "highlighter") "半透明标记 · 同一笔交叉不加深" else if (style.brush == "pressure") "随手写笔压力变化的自然线条" else "稳定等宽 · 适合勾画与标注",
-                color = ToolMuted, style = MaterialTheme.typography.bodySmall)
+
         }
 
-        if (panel == "settings") Column(Modifier.align(Alignment.TopEnd).padding(top = 84.dp, start = 16.dp, end = 16.dp)
+        if (panel == "settings") Column(Modifier.align(Alignment.TopEnd).padding(top = 84.dp + audioOffset, start = 16.dp, end = 16.dp)
             .widthIn(max = 360.dp).fillMaxWidth().heightIn(max = panelHeight).glass(24)
             .verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Text("阅读设置", color = ToolInk, style = MaterialTheme.typography.titleMedium)
@@ -161,7 +158,7 @@ internal fun ReaderTools(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun SlimSlider(value: Float, onValueChange: (Float) -> Unit, valueRange: ClosedFloatingPointRange<Float>,
+internal fun SlimSlider(value: Float, onValueChange: (Float) -> Unit, valueRange: ClosedFloatingPointRange<Float>,
     modifier: Modifier = Modifier, onValueChangeFinished: () -> Unit = {}, enabled: Boolean = true) {
     Slider(value, onValueChange, modifier, enabled = enabled, valueRange = valueRange, onValueChangeFinished = onValueChangeFinished,
         thumb = { Box(Modifier.size(18.dp).liquidGlass(9).padding(3.dp).background(if (enabled) Color(0xff567896) else ToolMuted, CircleShape)) },
@@ -187,9 +184,9 @@ private fun SettingSwitch(label: String, checked: Boolean, onClick: () -> Unit) 
 @Composable
 private fun ColorButton(color: Int, selected: Boolean, onClick: () -> Unit) {
     val name = when (color) { Swatches[0] -> "墨黑"; Swatches[1] -> "雾蓝"; Swatches[2] -> "陶粉"; Swatches[3] -> "暖黄"; Swatches[4] -> "鼠尾草绿"; Swatches[5] -> "淡紫"; else -> "当前颜色" }
-    Box(Modifier.size(48.dp).clip(CircleShape).glassClickable(selected, Role.RadioButton, onClick)
+    Box(Modifier.size(38.dp).clip(CircleShape).glassClickable(selected, Role.RadioButton, onClick)
         .semantics { contentDescription = name; this.selected = selected }, contentAlignment = Alignment.Center) {
-        Box(Modifier.size(if (selected) 28.dp else 22.dp).border(if (selected) 2.dp else 0.dp, if (selected) ToolInk else Color.Transparent, CircleShape)
+        Box(Modifier.size(if (selected) 28.dp else 22.dp).border(if (selected) 2.dp else 0.dp, if (selected) Color.Black else Color.Transparent, CircleShape)
             .padding(4.dp).background(Color(color), CircleShape))
     }
 }
@@ -218,51 +215,14 @@ private fun ToolButton(icon: String, label: String, selected: Boolean, onClick: 
     }
 }
 
-/** Stylus with two tap waves; a slash and muted colour indicate disabled. */
-@Composable
-private fun DoubleTapButton(enabled: Boolean, onChange: (Boolean) -> Unit) {
-    val interaction = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
-    Box(Modifier.size(40.dp).glass().glassFeedback(interaction, enabled).toggleable(enabled, interactionSource = interaction, indication = null, role = Role.Switch, onValueChange = onChange)
-        .semantics { contentDescription = "轻敲切换笔刷与橡皮"; stateDescription = if (enabled) "已开启" else "已关闭" }
-        .padding(4.dp).background(if (enabled) ToolInk.copy(alpha = .11f) else Color.Transparent, CircleShape),
-        contentAlignment = Alignment.Center) {
-        Canvas(Modifier.size(24.dp)) {
-            val ink = if (enabled) ToolInk else ToolMuted
-            fun p(x: Float, y: Float) = Offset(x * size.width / 24, y * size.height / 24)
-            fun line(x: Float, y: Float, x2: Float, y2: Float) =
-                drawLine(ink, p(x, y), p(x2, y2), 1.7.dp.toPx(), StrokeCap.Round)
-            val pen = Path().apply {
-                moveTo(p(4f, 20f).x, p(4f, 20f).y)
-                lineTo(p(6f, 14f).x, p(6f, 14f).y)
-                lineTo(p(15f, 5f).x, p(15f, 5f).y)
-                lineTo(p(19f, 9f).x, p(19f, 9f).y)
-                lineTo(p(10f, 18f).x, p(10f, 18f).y)
-                close()
-            }
-            drawPath(pen, ink, style = Stroke(1.7.dp.toPx()))
-            line(6f, 14f, 10f, 18f)
-            for (shift in listOf(0f, 4f)) {
-                val wave = Path().apply {
-                    moveTo(p(3f + shift, 3f).x, p(3f + shift, 3f).y)
-                    quadraticTo(p(6f + shift, 5f).x, p(6f + shift, 5f).y, p(6f + shift, 8f).x, p(6f + shift, 8f).y)
-                }
-                drawPath(wave, ink, style = Stroke(1.5.dp.toPx(), cap = StrokeCap.Round))
-            }
-            if (!enabled) {
-                drawLine(Color(0xfff1f3f2), p(3f, 3f), p(21f, 21f), 4.dp.toPx(), StrokeCap.Round)
-                line(3f, 3f, 21f, 21f)
-            }
-        }
-    }
-}
-
-/** The quick palette uses the existing exact swatches, with no rings or plus button. */
+/** The quick palette uses the existing exact swatches, with a black selection ring. */
 @Composable
 private fun QuickColorButton(color: Int, selected: Boolean, compact: Boolean, onClick: () -> Unit) {
     val label = when (color) { Swatches[0] -> "墨黑"; Swatches[1] -> "雾蓝"; else -> "陶粉" }
     Box(Modifier.width(if (compact) 24.dp else 32.dp).height(40.dp)
         .glassClickable(selected, Role.RadioButton, onClick)
         .semantics { contentDescription = label; this.selected = selected }, contentAlignment = Alignment.Center) {
-        Box(Modifier.size(if (selected) 20.dp else 18.dp).background(Color(color), CircleShape))
+        Box(Modifier.size(28.dp).border(if (selected) 2.dp else 0.dp, if (selected) Color.Black else Color.Transparent, CircleShape)
+            .padding(5.dp).background(Color(color), CircleShape))
     }
 }

@@ -31,6 +31,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.drawscope.scale
 import androidx.compose.ui.graphics.drawscope.translate
+import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.res.imageResource
 import androidx.compose.ui.unit.IntSize
@@ -98,17 +99,14 @@ internal fun Modifier.liquidGlass(radius: Int = 28, tintAlpha: Float = .24f): Mo
 internal fun LeatherBackground(modifier: Modifier = Modifier) {
     val texture = ImageBitmap.imageResource(R.drawable.leather_surface)
     Canvas(modifier.fillMaxSize().glassSource()) {
-        // Keep the grain at a fixed physical scale; mirror neighbouring tiles to avoid seams.
-        val tile = 300.dp.roundToPx()
-        for (row in 0..(size.height / tile).toInt()) {
-            for (column in 0..(size.width / tile).toInt()) {
-                translate(column * tile.toFloat(), row * tile.toFloat()) {
-                    scale(if (column % 2 == 0) 1f else -1f, if (row % 2 == 0) 1f else -1f,
-                        pivot = Offset(tile / 2f, tile / 2f)) {
-                        drawImage(texture, dstSize = IntSize(tile, tile))
-                    }
-                }
-            }
+        // Keep the whole supplied 3096×2064 surface; rotate with the tablet in portrait.
+        val portrait = size.height > size.width
+        val target = if (portrait) IntSize(size.height.toInt(), size.width.toInt())
+            else IntSize(size.width.toInt(), size.height.toInt())
+        rotate(if (portrait) 90f else 0f) {
+            drawImage(texture, dstOffset = androidx.compose.ui.unit.IntOffset(
+                ((size.width - target.width) / 2).toInt(), ((size.height - target.height) / 2).toInt()),
+                dstSize = target, filterQuality = androidx.compose.ui.graphics.FilterQuality.High)
         }
         drawRect(GlassPaper.copy(alpha = .28f))
     }

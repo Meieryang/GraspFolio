@@ -3,6 +3,7 @@
     <application>
         <!-- Isolated UI fixture: debug builds only; never reads or edits user documents. -->
         <activity android:name=".ReaderToolsPreviewActivity" android:exported="true" />
+        <activity android:name=".ReaderLoadingTestActivity" android:exported="false" />
         <activity android:name=".CornerNavigationTestActivity" android:exported="true" />
         <provider android:name=".StorageTestProvider" android:authorities="io.graspfolio.app.storagefixture"
             android:exported="true" android:permission="android.permission.MANAGE_DOCUMENTS" android:grantUriPermissions="true" />

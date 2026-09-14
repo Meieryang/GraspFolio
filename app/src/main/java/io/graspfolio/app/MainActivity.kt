@@ -1,6 +1,8 @@
 package io.graspfolio.app
 
 import android.content.Context
+import android.content.ContextWrapper
+import androidx.lifecycle.ViewModelProvider
 import android.content.Intent
 import android.content.res.Configuration
 import android.graphics.Bitmap
@@ -29,6 +31,9 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.width
+import androidx.compose.material3.LinearProgressIndicator
+import kotlinx.coroutines.ensureActive
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -85,6 +90,21 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.CancellationException
 
 class MainActivity : ComponentActivity() {
+    internal val hoverSwitch = DoubleTapSwitch().apply { enabled = false }
+    override fun dispatchGenericMotionEvent(event: android.view.MotionEvent): Boolean {
+        hoverSwitch.observeStylus(event)
+        return super.dispatchGenericMotionEvent(event)
+    }
+    override fun dispatchTouchEvent(event: android.view.MotionEvent): Boolean {
+        hoverSwitch.observeStylus(event)
+        return super.dispatchTouchEvent(event)
+    }
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        if (!hasFocus) hoverSwitch.enabled = false
+        super.onWindowFocusChanged(hasFocus)
+    }
+    override fun onPause() { hoverSwitch.enabled = false; super.onPause() }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -108,15 +128,17 @@ private fun GraspFolioApp(initialUri: Uri?) {
         }
     }
     if (documentPath == null) LibraryScreen(onOpen = { openPdf.launch(arrayOf("application/pdf")) }, onRead = { documentPath = it.toString() })
-    else PdfReader(Uri.parse(documentPath!!), onOpenAnother = { openPdf.launch(arrayOf("application/pdf")) }, onExit = { documentPath = null })
+    else key(documentPath) { PdfReader(Uri.parse(documentPath!!), onOpenAnother = { openPdf.launch(arrayOf("application/pdf")) }, onExit = { documentPath = null }) }
 }
 
 @Composable
-private fun PdfReader(uri: Uri, onOpenAnother: () -> Unit, onExit: () -> Unit) {
+internal fun PdfReader(uri: Uri, onOpenAnother: () -> Unit, onExit: () -> Unit, recordRecent: Boolean = true) {
     ImmersiveReading()
     val context = LocalContext.current
-    val annotations = remember(uri) { AnnotationStore.obtain(context, uri) }
-    DisposableEffect(annotations) { onDispose { annotations.release() } }
+    val activity = remember(context) { generateSequence(context) { (it as? ContextWrapper)?.baseContext }.filterIsInstance<ComponentActivity>().first() }
+    val sessions = remember(activity) { ViewModelProvider(activity)[ReaderSessions::class.java] }
+    val annotations = remember(uri, sessions) { sessions.open(context, uri) }
+    DisposableEffect(annotations, activity) { onDispose { if (!activity.isChangingConfigurations) sessions.close(uri) } }
     val readerLifecycle = androidx.lifecycle.compose.LocalLifecycleOwner.current.lifecycle
     DisposableEffect(annotations, readerLifecycle) {
         val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
@@ -133,13 +155,11 @@ private fun PdfReader(uri: Uri, onOpenAnother: () -> Unit, onExit: () -> Unit) {
     val penSettings = remember { context.getSharedPreferences("pen_settings", Context.MODE_PRIVATE) }
     var brushStyle by remember { mutableStateOf(penSettings.loadBrush().let { if (it.brush == "fineliner") it.copy(brush = "pressure") else it }) }
     val selectStyle: (BrushStyle) -> Unit = { brushStyle = it; penSettings.saveBrush(it) }
-    var doubleTapEnabled by rememberSaveable { mutableStateOf(penSettings.getBoolean("double_tap_enabled", true)) }
     var writingVibration by rememberSaveable { mutableStateOf(penSettings.getBoolean("writing_vibration", true)) }
     var predictionEnabled by rememberSaveable { mutableStateOf(penSettings.getBoolean("prediction", true)) }
     var frontBufferEnabled by rememberSaveable { mutableStateOf(penSettings.getBoolean("front_buffer", true)) }
     var penDiagnostics by remember { mutableStateOf("写几笔后显示 SDK 状态和绘制耗时") }
     var penContact by remember { mutableStateOf(false) }
-    BackHandler { chrome = chrome.onBack() }
     val folderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { it?.let(annotations::authorize) }
     val progressStore = remember(context) { ReadingProgressStore(context) }
     val savedProgress = remember(uri) { progressStore.load(uri.toString()) }
@@ -147,23 +167,36 @@ private fun PdfReader(uri: Uri, onOpenAnother: () -> Unit, onExit: () -> Unit) {
     var cover by remember(uri) { mutableStateOf(savedProgress.cover) }
     var document by remember(uri) { mutableStateOf<PdfDocument?>(null) }
     var error by remember(uri) { mutableStateOf<String?>(null) }
+    var openAttempt by remember(uri) { mutableIntStateOf(0) }
+    var pdfLoading by remember(uri) { mutableStateOf(DocumentLoading("正在读取页面信息")) }
+    var readerStarted by remember(uri) { mutableStateOf(false) }
+    var restoredDocument by remember(uri) { mutableStateOf<PdfDocument?>(null) }
     var page by remember(uri) { mutableIntStateOf(savedProgress.page) }
     var rendered by remember(uri) { mutableStateOf<RenderedPages?>(null) }
+    val audioPages = document?.let { readingPages(page, it.pageCount, spread, cover).filterNotNull() } ?: emptyList()
+    val audioUi = readerAudioUi(annotations, audioPages, menu)
     val bitmap = rendered?.bitmap
     var renderWidth by remember { mutableIntStateOf(0) }
     var holdPosition by remember { mutableStateOf<Offset?>(null) }
     var holdOrigin by remember { mutableStateOf<Offset?>(null) }
     var holdDirection by remember { mutableStateOf(0) }
-    LaunchedEffect(uri) {
+    LaunchedEffect(uri, openAttempt) {
         var opened: PdfDocument? = null
         try {
-            withContext(Dispatchers.IO) { opened = PdfDocument(context, uri) }
+            val job = coroutineContext[kotlinx.coroutines.Job]!!
+            withContext(Dispatchers.IO) {
+                opened = PdfDocument(context, uri)
+                opened!!.readPageInfo(cancelled = { !job.isActive }) { value ->
+                    android.os.Handler(android.os.Looper.getMainLooper()).post { if (job.isActive) pdfLoading = value }
+                }
+            }
             val active = checkNotNull(opened)
             page = page.coerceIn(0, active.pageCount - 1)
             document = active
             kotlinx.coroutines.awaitCancellation()
         } catch (cancelled: CancellationException) { throw cancelled }
         catch (failure: Exception) { error = "无法打开这个 PDF：${failure.message ?: "文件可能已损坏或不可访问"}" }
+        catch (_: OutOfMemoryError) { error = "内存不足，无法打开文档，请关闭其他应用后重试。" }
         finally {
             withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) { opened?.close() }
         }
@@ -173,16 +206,39 @@ private fun PdfReader(uri: Uri, onOpenAnother: () -> Unit, onExit: () -> Unit) {
             val restored = annotations.progress ?: savedProgress
             page = restored.page.coerceIn(0, active.pageCount - 1)
             cover = restored.cover
+            restoredDocument = active
         }
     }
-    LaunchedEffect(document, page, renderWidth, spread, cover) {
-        document?.takeIf { renderWidth > 0 }?.let { active ->
+    LaunchedEffect(document, page, renderWidth, spread, cover, annotations.ready, restoredDocument) {
+        document?.takeIf { renderWidth > 0 && annotations.ready && restoredDocument === it }?.let { active ->
             val pages = readingPages(page, active.pageCount, spread, cover)
+            var candidate: RenderedPages? = null
             try {
-                rendered = withContext(Dispatchers.Default) { active.render(pages, renderWidth) }
+                val started = System.nanoTime()
+                withContext(Dispatchers.Default) { candidate = active.render(pages, renderWidth) }
+                coroutineContext.ensureActive()
+                // Publish PDF placements and the already-resident ink in the same UI turn.
+                annotations.showPages(pages.filterNotNull().toSet())
+                rendered = candidate
+                candidate = null
+                readerStarted = true
+                android.util.Log.i("GraspFolioPerf", "reader_page_publish ms=${(System.nanoTime() - started) / 1_000_000.0}")
             } catch (cancelled: CancellationException) { throw cancelled }
             catch (failure: Exception) { error = "页面渲染失败：${failure.message ?: "未知错误"}" }
+            catch (_: OutOfMemoryError) { error = "内存不足，无法显示阅读画面。" }
+            finally { candidate?.bitmap?.recycle() }
         }
+    }
+    LaunchedEffect(readerStarted, document) {
+        if (readerStarted && recordRecent) LibraryRepository(context.applicationContext).recordOpened(uri)
+    }
+    val opening = !readerStarted || !annotations.ready || document == null
+    BackHandler { if (opening || error != null) onExit() else chrome = chrome.onBack() }
+    val retryOpen: () -> Unit = {
+        error = null; readerStarted = false; rendered = null; document = null; restoredDocument = null
+        pdfLoading = DocumentLoading("正在读取页面信息")
+        if (annotations.loading.error != null) annotations.retryLoad()
+        openAttempt++
     }
     val navigate: (Int) -> Unit = { direction ->
         document?.takeIf { annotations.ready }?.let { active ->
@@ -192,10 +248,14 @@ private fun PdfReader(uri: Uri, onOpenAnother: () -> Unit, onExit: () -> Unit) {
     }
     // Hidden system bars occupy no layout space. Only physical cutouts and a system-owned
     // desktop caption (if present) reduce the usable area; page fit and corner input share it.
-    Box(Modifier.fillMaxSize().background(Paper).windowInsetsPadding(WindowInsets.displayCutout.union(WindowInsets.captionBar))) {
+    BoxWithConstraints(Modifier.fillMaxSize().background(Paper).windowInsetsPadding(WindowInsets.displayCutout.union(WindowInsets.captionBar))) {
+        val targetWidth = with(LocalDensity.current) { maxWidth.roundToPx() }.coerceAtLeast(1)
+        LaunchedEffect(targetWidth) { renderWidth = targetWidth }
         when {
-            error != null -> ErrorScreen(error!!, onOpenAnother)
-            document == null -> LoadingScreen()
+            error != null || annotations.loading.error != null -> LoadingScreen(
+                DocumentLoading("打开失败", error = error ?: annotations.loading.error), onExit, retryOpen)
+            opening -> LoadingScreen(if (document == null) pdfLoading else if (!annotations.ready) annotations.loading
+                else DocumentLoading("正在准备阅读画面"), onExit, retryOpen)
             else -> BoxWithConstraints(
                 Modifier.fillMaxSize(), contentAlignment = Alignment.Center
             ) {
@@ -203,7 +263,7 @@ private fun PdfReader(uri: Uri, onOpenAnother: () -> Unit, onExit: () -> Unit) {
                 val viewport = with(density) { Size(maxWidth.toPx(), maxHeight.toPx()) }
                 val pageBounds = bitmap?.let { fittedPageBounds(viewport, Size(it.width.toFloat(), it.height.toFloat())) } ?: Rect.Zero
                 val currentPages = readingPages(page, document!!.pageCount, spread, cover)
-                val renderReady = rendered?.indices == currentPages
+                val renderReady = rendered?.indices == currentPages && rendered?.targetWidth == renderWidth
                 val inkPages = rendered?.let { result ->
                     val fit = pageBounds.width / result.bitmap.width
                     result.placements.map { p -> p.copy(left = pageBounds.left + p.left * fit, top = pageBounds.top + p.top * fit, scale = p.scale * fit) }
@@ -219,10 +279,8 @@ private fun PdfReader(uri: Uri, onOpenAnother: () -> Unit, onExit: () -> Unit) {
                     onContinuousMove = { holdPosition = it },
                     onContinuousEnd = { holdOrigin = null; holdPosition = null; holdDirection = 0 }
                 )) {
-                BoxWithConstraints(Modifier.fillMaxSize().glassSource().background(Paper)) {
-                    val targetWidth = with(LocalDensity.current) { maxWidth.roundToPx() }.coerceAtLeast(1)
-                    LaunchedEffect(targetWidth) { renderWidth = targetWidth }
-                    bitmap?.let { Image(it.asImageBitmap(), "PDF 第 ${page + 1} 页", Modifier.fillMaxSize(), contentScale = ContentScale.Fit) }
+                Box(Modifier.fillMaxSize().glassSource().background(Paper)) {
+                    bitmap?.let { Image(it.asImageBitmap(), "PDF 第 ${(rendered?.indices?.filterNotNull()?.firstOrNull() ?: page) + 1} 页", Modifier.fillMaxSize(), contentScale = ContentScale.Fit) }
                 }
                 AndroidView(
                     factory = { StylusInkView(it) },
@@ -233,19 +291,20 @@ private fun PdfReader(uri: Uri, onOpenAnother: () -> Unit, onExit: () -> Unit) {
                         view.lasso = lasso
                         view.eraser = eraser
                         view.brushStyle = brushStyle
-                        view.doubleTapEnabled = doubleTapEnabled
                         view.writingVibration = writingVibration
                         view.onDiagnostics = { penDiagnostics = it }
                         view.predictionEnabled = predictionEnabled
                         view.frontBufferEnabled = frontBufferEnabled
-                        view.enabledForWriting = annotations.ready && renderReady
+                        view.enabledForWriting = annotations.ready && renderReady && annotations.loadedPages == currentPages.filterNotNull().toSet()
                         view.onPageContact = { pageContactSequence++ }
-                        view.onChange = annotations::replace
+                        view.onChange = { value ->
+                            if (renderReady && annotations.loadedPages == currentPages.filterNotNull().toSet()) annotations.replace(value)
+                        }
                         view.onContact = { penContact = it }
                         view.onToggle = { lasso = false; eraser = !eraser }
                     }
                 )
-                val label = readingPages(page, document!!.pageCount, spread, cover).filterNotNull().joinToString("–") { (it + 1).toString() }
+                val label = rendered!!.indices.filterNotNull().joinToString("–") { (it + 1).toString() }
                 if (!menu) PageNumber(label, document!!.pageCount, Modifier.align(Alignment.BottomCenter))
                 holdOrigin?.let { origin ->
                     ContinuousTurnIndicator(origin, holdPosition ?: origin, holdDirection)
@@ -256,8 +315,9 @@ private fun PdfReader(uri: Uri, onOpenAnother: () -> Unit, onExit: () -> Unit) {
                 }
             }
         }
-        if (chrome != ReaderChrome.READING) key(menu) { ReaderTools(
+        if (!opening && error == null && chrome != ReaderChrome.READING) key(menu) { ReaderTools(
             immersiveBar = !menu,
+            audioUi = if (menu) audioUi else null,
             brushColor = { penSettings.loadBrush(it).opaqueColor },
             lasso = lasso, onLasso = { lasso = true; eraser = false },
             dismissBrushRequest = pageContactSequence,
@@ -269,12 +329,9 @@ private fun PdfReader(uri: Uri, onOpenAnother: () -> Unit, onExit: () -> Unit) {
             writingVibration = writingVibration, onVibration = { writingVibration = !writingVibration; penSettings.edit().putBoolean("writing_vibration", writingVibration).apply() },
             prediction = predictionEnabled, onPrediction = { predictionEnabled = !predictionEnabled; penSettings.edit().putBoolean("prediction", predictionEnabled).apply() },
             frontBuffer = frontBufferEnabled, onFrontBuffer = { frontBufferEnabled = !frontBufferEnabled; penSettings.edit().putBoolean("front_buffer", frontBufferEnabled).apply() },
-            doubleTapEnabled = doubleTapEnabled, onDoubleTapEnabled = { enabled ->
-                doubleTapEnabled = enabled
-                penSettings.edit().putBoolean("double_tap_enabled", enabled).apply()
-            },
             diagnostics = penDiagnostics, saveStatus = annotations.status, onAuthorize = { folderPicker.launch(null) }, onRetry = annotations::retry, onExit = onExit
         ) }
+        if (!opening && error == null && !menu) ImmersiveAudio(audioUi, chrome == ReaderChrome.WRITING)
     }
 }
 
@@ -337,7 +394,7 @@ private suspend fun PointerInputScope.cornerNavigation(cornerScale: Float, pageB
     awaitPointerEventScope {
       while (true) {
         // Observe each new finger independently; a resting finger must not block the next press.
-        val corner = 92f * density * cornerScale
+        val corner = PageCornerSizeDp * density * cornerScale
         var gestureBounds = pageBounds()
         var candidate: PointerInputChange? = null
         while (candidate == null) {
@@ -407,7 +464,25 @@ private fun ContinuousTurnIndicator(origin: Offset, position: Offset, direction:
     drawCircle(Ink.copy(alpha = .75f), 5.dp.toPx(), thumb)
 }
 
-@Composable private fun LoadingScreen() = Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { LeatherBackground(); Text("正在打开书页…", color = MutedInk, modifier = Modifier.liquidGlass().padding(24.dp)) }
+@Composable private fun LoadingScreen(state: DocumentLoading, onBack: () -> Unit, onRetry: () -> Unit) =
+    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        LeatherBackground()
+        Column(Modifier.width(360.dp).liquidGlass().padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(state.error ?: state.stage, color = Ink, textAlign = TextAlign.Center)
+            Spacer(Modifier.height(18.dp))
+            if (state.error == null) {
+                val fraction = state.fraction
+                if (fraction == null) LinearProgressIndicator() else LinearProgressIndicator(progress = { fraction })
+                state.total?.let { total ->
+                    Spacer(Modifier.height(10.dp))
+                    Text(if (state.stage.contains("页面")) "已读取 ${state.completed} / $total 页"
+                        else "已加载 ${state.completed} / $total 条", color = MutedInk)
+                }
+            } else GlassAction("重试", onRetry)
+            Spacer(Modifier.height(14.dp))
+            GlassAction("返回", onBack)
+        }
+    }
 @Composable private fun ErrorScreen(message: String, onOpenAnother: () -> Unit) = Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { LeatherBackground(); Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(32.dp).liquidGlass().padding(24.dp)) { Text(message, color = Ink, textAlign = TextAlign.Center); Spacer(Modifier.height(18.dp)); GlassAction("选择其他 PDF", onOpenAnother) } }
 
 private fun vibrate(context: Context) {
@@ -415,16 +490,32 @@ private fun vibrate(context: Context) {
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) vibrator.vibrate(VibrationEffect.createOneShot(25, VibrationEffect.DEFAULT_AMPLITUDE)) else @Suppress("DEPRECATION") vibrator.vibrate(25)
 }
 
-private data class RenderedPages(val bitmap: Bitmap, val placements: List<PagePlacement>, val indices: List<Int?>)
+private data class RenderedPages(val bitmap: Bitmap, val placements: List<PagePlacement>, val indices: List<Int?>, val targetWidth: Int)
 
 private class PdfDocument(context: Context, uri: Uri) : AutoCloseable {
     private val descriptor: ParcelFileDescriptor = context.contentResolver.openFileDescriptor(uri, "r") ?: error("无法读取文件")
     private val renderer = try { PdfRenderer(descriptor) } catch (failure: Exception) { descriptor.close(); throw failure }
     val pageCount = renderer.pageCount
-    init { if (pageCount == 0) { renderer.close(); error("PDF 没有页面") } }
+    init { if (pageCount == 0) { renderer.close(); descriptor.close(); error("PDF 没有页面") } }
+    private var pageSizes: List<Size> = emptyList()
+    @Synchronized
+    fun readPageInfo(cancelled: () -> Boolean, progress: (DocumentLoading) -> Unit) {
+        val result = ArrayList<Size>(pageCount)
+        var lastReport = 0L
+        progress(DocumentLoading("正在读取页面信息", 0, pageCount))
+        repeat(pageCount) { index ->
+            if (cancelled()) throw CancellationException("已取消打开")
+            renderer.openPage(index).use { result += Size(it.width.toFloat(), it.height.toFloat()) }
+            val now = System.nanoTime()
+            if (index == pageCount - 1 || now - lastReport >= 50_000_000) {
+                progress(DocumentLoading("正在读取页面信息", index + 1, pageCount)); lastReport = now
+            }
+        }
+        pageSizes = result
+    }
     @Synchronized
     fun render(indices: List<Int?>, targetWidth: Int): RenderedPages {
-        val dimensions = indices.map { index -> index?.let { renderer.openPage(it).use { p -> Size(p.width.toFloat(), p.height.toFloat()) } } }
+        val dimensions = indices.map { index -> index?.let { pageSizes[it] } }
         val fallback = dimensions.first { it != null }!!
         val sizes = dimensions.map { it ?: fallback }
         val totalWidth = sizes.sumOf { it.width.toDouble() }.toFloat()
@@ -447,7 +538,7 @@ private class PdfDocument(context: Context, uri: Uri) : AutoCloseable {
                 }
                 x += width
             }
-            return RenderedPages(bitmap, placements, indices)
+            return RenderedPages(bitmap, placements, indices, targetWidth)
         } catch (failure: Exception) { bitmap.recycle(); throw failure }
     }
     @Synchronized

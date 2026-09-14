@@ -14,6 +14,30 @@ class AnnotationJournalTest {
         check(directory.mkdir())
         try { block(File(directory, "recovery.json")) } finally { directory.deleteRecursively() }
     }
+    @Test fun freshReadingProgressAllowsImportAfterReopenAndCompaction() = inDirectory { file ->
+        var journal = AnnotationJournal(file, "pdf")
+        journal.replace(journal.state.strokes, ReadingProgress(4, true))
+        assertTrue(journal.state.dirty)
+        assertTrue(journal.state.canImportRemote)
+        journal = AnnotationJournal(file, "pdf")
+        assertTrue(journal.state.canImportRemote)
+        journal.compact()
+        assertTrue(AnnotationJournal(file, "pdf").state.canImportRemote)
+        journal.importRemote(listOf(stroke("original")), "remote")
+        assertEquals("original", AnnotationJournal(file, "pdf").state.strokes.single().id)
+    }
+    @Test fun erasedLocalInkAndLegacyUnknownHistoryRemainProtected() = inDirectory { file ->
+        var journal = AnnotationJournal(file, "pdf")
+        journal.replace(listOf(stroke("local")))
+        journal.replace(emptyList())
+        journal.compact()
+        journal = AnnotationJournal(file, "pdf")
+        assertFalse(journal.state.canImportRemote)
+        val old = JSONObject(file.readText()).apply { remove("contentRevision") }
+        file.writeText(old.toString())
+        assertFalse(AnnotationJournal(file, "pdf").state.canImportRemote)
+    }
+
     @Test fun editsEraseAndOldAcknowledgementRecoverWithoutLosingNewInk() = inDirectory { file ->
         val journal = AnnotationJournal(file, "pdf")
         val a = stroke("a"); val b = stroke("b")
@@ -35,7 +59,8 @@ class AnnotationJournalTest {
         file.writeText(original)
         val journal = AnnotationJournal(file, "pdf")
         journal.replace(listOf(a, stroke("new")))
-        assertEquals(original, file.readText())
+        assertEquals(4, JSONObject(file.readText()).getInt("journalVersion"))
+        assertEquals(listOf(a, stroke("new")), journal.state.strokes)
         val restored = AnnotationJournal(file, "pdf")
         assertEquals(2, restored.state.strokes.size); assertTrue(restored.state.dirty)
         assertEquals("known", restored.state.base)
@@ -92,4 +117,18 @@ class AnnotationJournalTest {
         assertEquals(ReadingProgress(23, false), restored.state.progress)
         assertFalse(restored.state.dirty)
     }
+    @Test fun spreadEditsKeepPerPageOrderAndUnloadedPages() = inDirectory { file ->
+        val left = stroke("left")
+        val right = stroke("right").copy(page = 1)
+        val far = stroke("far").copy(page = 900)
+        val journal = AnnotationJournal(file, "pdf")
+        journal.importRemote(listOf(right, far, left), "initial")
+        val added = stroke("new-left")
+        journal.replacePages(setOf(0, 1), listOf(left, added, right))
+        val recovered = AnnotationJournal(file, "pdf")
+        assertEquals(listOf(left, added), recovered.window(setOf(0)))
+        assertEquals(listOf(right), recovered.window(setOf(1)))
+        assertEquals(listOf(far), recovered.window(setOf(900)))
+    }
+
 }

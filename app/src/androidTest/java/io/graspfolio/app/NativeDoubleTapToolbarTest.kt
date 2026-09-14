@@ -39,29 +39,14 @@ class NativeDoubleTapToolbarTest {
         }
         for (tool in listOf("压感笔", "荧光笔", "整笔橡皮", "套索笔", "墨黑", "雾蓝", "陶粉")) awaitNode(tool)
         assertNull(find(automation.rootInActiveWindow, "等宽笔"))
-        val label = "轻敲切换笔刷与橡皮"
-        val toggle = awaitNode(label, true)
-        assertTrue(toggle.isCheckable)
-        val toggleBounds = Rect().also { toggle.getBoundsInScreen(it) }
-        val brushBounds = Rect().also { awaitNode("陶粉").getBoundsInScreen(it) }
-        val settingsBounds = Rect().also { awaitNode("阅读设置与保存").getBoundsInScreen(it) }
-        assertTrue(brushBounds.right <= toggleBounds.left)
-        assertTrue(toggleBounds.right <= settingsBounds.left)
-        assertEquals(toggleBounds.width(), toggleBounds.height())
+        assertNull(find(automation.rootInActiveWindow, "轻敲切换笔刷与橡皮"))
         fun screenshot(state: String) {
             val bitmap = checkNotNull(automation.takeScreenshot())
             File(instrumentation.targetContext.cacheDir, "tap-${if (narrow) "compact" else if (landscape) "landscape" else "portrait"}-$state.png")
                 .outputStream().use { bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it) }
             bitmap.recycle()
         }
-        screenshot("on")
-        assertTrue(toggle.performAction(AccessibilityNodeInfo.ACTION_CLICK))
-        val off = awaitNode(label, false)
-        if (android.os.Build.VERSION.SDK_INT >= 30) assertEquals("已关闭", off.stateDescription?.toString())
-        screenshot("off")
-        assertTrue(off.performAction(AccessibilityNodeInfo.ACTION_CLICK))
-        val on = awaitNode(label, true)
-        if (android.os.Build.VERSION.SDK_INT >= 30) assertEquals("已开启", on.stateDescription?.toString())
+        screenshot("tools")
         if (!landscape && !narrow) {
             fun tap(label: String) {
                 val bounds = Rect().also { awaitNode(label).getBoundsInScreen(it) }
@@ -86,8 +71,8 @@ class NativeDoubleTapToolbarTest {
                 while (SystemClock.uptimeMillis() < deadline && matchingTipPixels <= 5) {
                     val bitmap = checkNotNull(automation.takeScreenshot())
                     matchingTipPixels = 0
-                    // Only the bottom quarter: a coloured barrel band cannot satisfy this check.
-                    for (y in bounds.top + bounds.height() * 3 / 4 until bounds.bottom.coerceAtMost(bitmap.height)) {
+                    // The lower half includes the retracted nib but excludes the coloured barrel band.
+                    for (y in bounds.top + bounds.height() / 2 until bounds.bottom.coerceAtMost(bitmap.height)) {
                         for (x in bounds.left.coerceAtLeast(0) until bounds.right.coerceAtMost(bitmap.width)) {
                             val pixel = bitmap.getPixel(x, y)
                             if (kotlin.math.abs(android.graphics.Color.red(pixel) - ((rgb shr 16) and 255)) < 12 &&

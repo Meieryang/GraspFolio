@@ -255,4 +255,76 @@ class AnnotationCoordinatorTest {
         }
         dir.deleteRecursively()
     }
+    @Test fun pageWindowChangesDrainEditsAndNeverReplaceUnloadedPages() {
+        val context = instrumentation.targetContext
+        val id = UUID.randomUUID().toString()
+        val uri = Uri.parse("content://graspfolio-page-test/$id")
+        val dir = File(context.cacheDir, "coordinator-test-$id").apply { check(mkdir()) }
+        val file = File(dir, "state.json")
+        val original = (0 until 120).map { stroke("page-$it").copy(page = it) }
+        AnnotationJournal(file, "pdf").importRemote(original, "initial")
+        val backend = object : AnnotationBackend {
+            override fun openJournal() = AnnotationJournal(file, "pdf")
+            override fun sync(folder: Uri, snapshot: DurableInk, allowLoad: Boolean) = error("No folder")
+        }
+        lateinit var store: AnnotationStore
+        onMain { store = AnnotationStore.obtain(context, uri, backend) }
+        eventually { var ready = false; onMain { ready = store.ready }; ready }
+        val middle = setOf(59, 60, 61)
+        onMain { store.showPages(middle) }
+        eventually { var loaded = false; onMain { loaded = store.loadedPages == middle }; loaded }
+        onMain {
+            assertEquals(original.filter { it.page in middle }, store.strokes)
+            store.replace(store.strokes.filterNot { it.page == 60 })
+            store.showPages(setOf(89, 90, 91))
+            store.saveProgress(ReadingProgress(90, false))
+            store.showPages(setOf(9, 10, 11))
+            store.showPages(setOf(118, 119))
+        }
+        eventually { var loaded = false; onMain { loaded = store.loadedPages == setOf(118, 119) }; loaded }
+        onMain {
+            assertEquals(original.takeLast(2), store.strokes)
+            store.release()
+        }
+        eventually { store.isClosed }
+        val recovered = AnnotationJournal(file, "pdf")
+        assertEquals(original.filterNot { it.page == 60 }, recovered.state.strokes)
+        assertEquals(ReadingProgress(90, false), recovered.state.progress)
+        context.getSharedPreferences("reading_progress", 0).edit().remove("$uri:page").remove("$uri:cover").commit()
+        dir.deleteRecursively()
+    }
+
+    @Test fun corruptFarPagePreventsOpeningAndRetryLoadsTheWholeBook() {
+        val context = instrumentation.targetContext
+        val id = UUID.randomUUID().toString()
+        val uri = Uri.parse("content://graspfolio-load-test/$id")
+        val dir = File(context.cacheDir, "coordinator-test-$id").apply { check(mkdir()) }
+        val file = File(dir, "state.json")
+        val journal = AnnotationJournal(file, "pdf")
+        journal.importRemote(listOf(stroke("near"), stroke("far").copy(page = 999)), "initial")
+        val indexed = journal.state.strokes as PagedInk
+        val bad = File(indexed.directory, indexed.refs.last().blob)
+        val original = bad.readBytes(); bad.writeText("broken")
+        val backend = object : AnnotationBackend {
+            override fun openJournal() = AnnotationJournal(file, "pdf")
+            override fun sync(folder: Uri, snapshot: DurableInk, allowLoad: Boolean) = error("No folder")
+        }
+        lateinit var store: AnnotationStore
+        onMain { store = AnnotationStore.obtain(context, uri, backend) }
+        eventually { var failed = false; onMain { failed = store.loading.error != null }; failed }
+        onMain { assertFalse(store.ready); assertTrue(store.strokes.isEmpty()) }
+        bad.writeBytes(original)
+        onMain { store.retryLoad() }
+        eventually { var ready = false; onMain { ready = store.ready }; ready }
+        val reads = InkPerformance.decodedBlobReads.get()
+        onMain {
+            store.showPages(setOf(999))
+            assertEquals("far", store.strokes.single().id)
+            assertEquals(reads, InkPerformance.decodedBlobReads.get())
+            store.release()
+        }
+        eventually { store.isClosed }
+        dir.deleteRecursively()
+    }
+
 }

@@ -5,6 +5,7 @@ import android.util.Log
 
 /** Counters/timings only: never log document names, URIs, or handwriting samples. */
 internal object InkPerformance {
+    val decodedBlobReads = java.util.concurrent.atomic.AtomicLong()
     inline fun <T> measure(stage: String, block: () -> T): T {
         val start = System.nanoTime()
         Trace.beginSection("GraspFolio.$stage")
