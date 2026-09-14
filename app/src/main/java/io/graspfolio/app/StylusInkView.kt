@@ -58,6 +58,7 @@ internal class VivoPenAdapter(private val activity: Activity, private val toggle
 internal class StylusInkView(context: Context) : FrameLayout(context), DefaultLifecycleObserver {
     init { setWillNotDraw(false) }
     private var front: FrontInkLayer? = null
+    internal val lowLatencyReady get() = Build.VERSION.SDK_INT >= 29 && front?.ready == true
     private var frontStroke = false
     private var frontSentCount = 0
     var frontBufferEnabled = true
@@ -86,6 +87,9 @@ internal class StylusInkView(context: Context) : FrameLayout(context), DefaultLi
     var brushStyle = BrushStyle()
     private var activeStyle = BrushStyle()
     var writingVibration = true
+    var predictionMode = PredictionMode.STABLE
+    private var activePredictionMode = PredictionMode.STABLE
+    private val predictionDiagnostics = PredictionDiagnostics()
     var predictionEnabled = true
         set(value) { if (field != value) { cancelStroke(); field = value; report() } }
     var enabledForWriting = false
@@ -189,6 +193,8 @@ internal class StylusInkView(context: Context) : FrameLayout(context), DefaultLi
                 onContact(true); invalidate(); return true
             }
             activeStyle = brushStyle
+            activePredictionMode = predictionMode
+            predictionDiagnostics.reset()
             drawCount = 0; drawNanos = 0; maxEventAge = 0; predictionAttempts = 0; acceptedPredictions = 0
             erasing = eraser || event.getToolType(actionIndex) == MotionEvent.TOOL_TYPE_ERASER || event.buttonState and MotionEvent.BUTTON_STYLUS_PRIMARY != 0
             if (erasing) InkPerformance.measure("erase_index") { spatial.sync(strokes) }
@@ -242,7 +248,8 @@ internal class StylusInkView(context: Context) : FrameLayout(context), DefaultLi
         } else null
         predicted = if (sdkAction == MotionEvent.ACTION_MOVE && !erasing && predictionEnabled) {
             predictionAttempts++
-            guardedPrediction(points, rawPrediction?.let { placement.toPage(it.x, it.y, event.getPressure(index), event.eventTime) }, placement.scale, resources.displayMetrics.density)
+            evaluatePrediction(points, rawPrediction?.let { placement.toPage(it.x, it.y, event.getPressure(index), event.eventTime) }, placement.scale, resources.displayMetrics.density, activePredictionMode)
+                .also { predictionDiagnostics.record(rawPrediction, it) }.point
                 .also { if (it != null) acceptedPredictions++ }
         } else null
         if (Build.VERSION.SDK_INT >= 29 && frontStroke) {
@@ -261,6 +268,8 @@ internal class StylusInkView(context: Context) : FrameLayout(context), DefaultLi
             lastSummary = "预测尾迹 $acceptedPredictions/$predictionAttempts；绘制CPU均值 " +
                 String.format(java.util.Locale.ROOT, "%.2f ms", if (drawCount == 0) 0.0 else drawNanos / drawCount / 1_000_000.0) + "；采样至绘制最大 ${maxEventAge} ms（非屏幕实测延迟）"
             if (Build.VERSION.SDK_INT >= 29 && frontStroke) lastSummary = "预测尾迹 $acceptedPredictions/$predictionAttempts；" + front?.summary()
+            lastSummary += "\n" + predictionDiagnostics.summary(activePredictionMode)
+            if ((context.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0) Log.d("GraspFolioPen", lastSummary)
             pointer = -1 // UP already reset SDK state; do not send an extra CANCEL.
             cancelStroke(); report()
         }
@@ -287,7 +296,8 @@ internal class StylusInkView(context: Context) : FrameLayout(context), DefaultLi
             val layer = front
             if (layer?.hasPending == true && isHardwareAccelerated) {
                 val ids = strokes.mapTo(mutableSetOf()) { it.id }
-                viewTreeObserver.registerFrameCommitCallback { post { if (front === layer) layer.handoff(ids) } }
+                val generation = layer.generation
+                viewTreeObserver.registerFrameCommitCallback { post { if (front === layer) layer.handoff(ids, generation) } }
             }
             if (frontStroke && layer?.ready != true) frontStroke = false
         }

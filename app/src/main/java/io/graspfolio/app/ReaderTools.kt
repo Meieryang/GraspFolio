@@ -58,6 +58,7 @@ internal fun ReaderTools(
     lasso: Boolean = false, onLasso: () -> Unit = {},
     immersiveBar: Boolean = false,
     brushColor: (String) -> Int = { if (it == "highlighter") Swatches[3] else Swatches[0] },
+    predictionMode: PredictionMode = PredictionMode.STABLE, onPredictionMode: (PredictionMode) -> Unit = {},
     audioUi: ReaderAudioUi? = null
 ) {
     var panel by rememberSaveable { mutableStateOf(initialPanel) }
@@ -132,6 +133,15 @@ internal fun ReaderTools(
             if (spread) SettingSwitch("封面单独显示", cover, onCover)
             SettingSwitch("书写振动", writingVibration, onVibration)
             SettingSwitch("笔迹预测", prediction, onPrediction)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                PredictionMode.entries.forEach { mode ->
+                    androidx.compose.material3.FilterChip(
+                        selected = predictionMode == mode, enabled = prediction,
+                        onClick = { onPredictionMode(mode) }, label = { Text(mode.label) },
+                        modifier = Modifier.weight(1f).liquidGlass(18)
+                    )
+                }
+            }
             SettingSwitch("低延迟前缓冲", frontBuffer, onFrontBuffer)
             HorizontalDivider(color = ToolMuted.copy(alpha = .15f))
             Text("批注保存", color = ToolInk, fontWeight = FontWeight.Medium)

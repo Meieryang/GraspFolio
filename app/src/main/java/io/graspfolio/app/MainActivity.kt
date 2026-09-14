@@ -157,6 +157,7 @@ internal fun PdfReader(uri: Uri, onOpenAnother: () -> Unit, onExit: () -> Unit, 
     val selectStyle: (BrushStyle) -> Unit = { brushStyle = it; penSettings.saveBrush(it) }
     var writingVibration by rememberSaveable { mutableStateOf(penSettings.getBoolean("writing_vibration", true)) }
     var predictionEnabled by rememberSaveable { mutableStateOf(penSettings.getBoolean("prediction", true)) }
+    var predictionModeKey by rememberSaveable { mutableStateOf(penSettings.getString("prediction_mode", PredictionMode.STABLE.key) ?: PredictionMode.STABLE.key) }
     var frontBufferEnabled by rememberSaveable { mutableStateOf(penSettings.getBoolean("front_buffer", true)) }
     var penDiagnostics by remember { mutableStateOf("写几笔后显示 SDK 状态和绘制耗时") }
     var penContact by remember { mutableStateOf(false) }
@@ -294,6 +295,7 @@ internal fun PdfReader(uri: Uri, onOpenAnother: () -> Unit, onExit: () -> Unit, 
                         view.writingVibration = writingVibration
                         view.onDiagnostics = { penDiagnostics = it }
                         view.predictionEnabled = predictionEnabled
+                        view.predictionMode = PredictionMode.fromKey(predictionModeKey)
                         view.frontBufferEnabled = frontBufferEnabled
                         view.enabledForWriting = annotations.ready && renderReady && annotations.loadedPages == currentPages.filterNotNull().toSet()
                         view.onPageContact = { pageContactSequence++ }
@@ -327,6 +329,7 @@ internal fun PdfReader(uri: Uri, onOpenAnother: () -> Unit, onExit: () -> Unit, 
             onPage = { target -> document?.takeIf { annotations.ready }?.let { doc -> page = readingPages(target, doc.pageCount, spread, cover).filterNotNull().first(); annotations.saveProgress(ReadingProgress(page, cover)) } },
             spread = spread, cover = cover, onCover = { if (annotations.ready) { cover = !cover; annotations.saveProgress(ReadingProgress(page, cover)) } },
             writingVibration = writingVibration, onVibration = { writingVibration = !writingVibration; penSettings.edit().putBoolean("writing_vibration", writingVibration).apply() },
+            predictionMode = PredictionMode.fromKey(predictionModeKey), onPredictionMode = { predictionModeKey = it.key; penSettings.edit().putString("prediction_mode", it.key).apply() },
             prediction = predictionEnabled, onPrediction = { predictionEnabled = !predictionEnabled; penSettings.edit().putBoolean("prediction", predictionEnabled).apply() },
             frontBuffer = frontBufferEnabled, onFrontBuffer = { frontBufferEnabled = !frontBufferEnabled; penSettings.edit().putBoolean("front_buffer", frontBufferEnabled).apply() },
             diagnostics = penDiagnostics, saveStatus = annotations.status, onAuthorize = { folderPicker.launch(null) }, onRetry = annotations::retry, onExit = onExit

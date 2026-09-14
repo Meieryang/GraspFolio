@@ -27,6 +27,9 @@ internal class FrontInkLayer(context: Context) {
     private var active = false
     private val frameGate = FrontFrameGate()
     private var drawnGeneration = 0L
+    private var sceneGeneration = 0L // Render thread only.
+    val generation get() = frameGate.generation
+    private fun trace(message: String) { if ((view.context.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0) Log.d("GraspFolioPen", "front epoch=$generation $message") }
     private fun requestRender() { if (frameGate.request()) view.renderFrontBufferedLayer() }
     val hasPending get() = pendingIds.isNotEmpty()
     val ready get() = initialized.get() && !closed.get() && view.isAttachedToWindow
@@ -41,7 +44,7 @@ internal class FrontInkLayer(context: Context) {
             }
             override fun onDrawFrontBufferedLayer(canvas: Canvas, width: Int, height: Int) = draw(canvas, width, height)
             override fun onFrontBufferedLayerRenderComplete(frontBufferedLayerSurfaceControl: SurfaceControlCompat, transaction: SurfaceControlCompat.Transaction) {
-                if (!enabled.get() || closed.get()) transaction.setVisibility(frontBufferedLayerSurfaceControl, false)
+                if (!enabled.get() || closed.get() || drawnGeneration != generation) transaction.setVisibility(frontBufferedLayerSurfaceControl, false)
                 val generation = drawnGeneration
                 view.post { if (!closed.get() && frameGate.complete(generation)) view.renderFrontBufferedLayer() }
             }
@@ -50,7 +53,7 @@ internal class FrontInkLayer(context: Context) {
     private fun draw(canvas: Canvas, width: Int, height: Int) {
         try {
             val start = System.nanoTime()
-            drawnGeneration = frameGate.generation
+            drawnGeneration = sceneGeneration
             scene.draw(canvas, width, height)
             if (enabled.get()) {
                 frames.incrementAndGet(); cpuNanos.addAndGet(System.nanoTime() - start)
@@ -64,6 +67,7 @@ internal class FrontInkLayer(context: Context) {
     }
     fun begin(page: PagePlacement, style: BrushStyle = BrushStyle()) {
         active = true; enabled.set(true); frames.set(0); cpuNanos.set(0); maxAge.set(0)
+        trace("begin pending=${pendingIds.size}")
         view.execute { scene.begin(page, style) }
     }
     fun append(points: List<InkPoint>, prediction: InkPoint?, eventTime: Long) {
@@ -73,13 +77,15 @@ internal class FrontInkLayer(context: Context) {
     }
     fun finish(id: String) {
         active = false; pendingIds += id
+        trace("finish pending=${pendingIds.size}")
         view.execute { scene.finish(id) }
         // This app hands ink to the parent's cache, not to LowLatencyCanvasView's
         // own HWUI bitmap. Keep the overlay until the parent's frame is submitted.
         requestRender()
     }
     /** Called after the parent has recorded the finished ink in this HWUI frame. */
-    fun handoff(committedIds: Set<String>) {
+    fun handoff(committedIds: Set<String>, frameGeneration: Long = generation) {
+        if (frameGeneration != generation) { trace("ignore stale handoff=$frameGeneration"); return }
         val delivered = pendingIds.intersect(committedIds)
         if (delivered.isEmpty()) return
         pendingIds.removeAll(delivered)
@@ -95,8 +101,13 @@ internal class FrontInkLayer(context: Context) {
     fun reset() {
         frameGate.reset()
         active = false; pendingIds.clear(); enabled.set(false)
-        view.execute { scene.reset() }
-        view.cancel(); view.clear()
+        val nextGeneration = generation
+        trace("reset")
+        // cancel()/clear() cancel pending renderer work but cannot cancel a draw already
+        // executing. A late clear could blank the next stroke. Queue an empty scene in
+        // the same stream as begin/append instead; the render callback hides it when idle.
+        view.execute { scene.reset(); sceneGeneration = nextGeneration }
+        requestRender()
     }
     fun close() { reset(); closed.set(true); initialized.set(false); view.setRenderCallback(null) }
     fun summary(): String = "前缓冲回调 ${frames.get()} 次；CPU均值 " +

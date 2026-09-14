@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <application>
+        <activity android:name=".PenPreviewActivity" android:exported="true" />
         <!-- Isolated UI fixture: debug builds only; never reads or edits user documents. -->
         <activity android:name=".ReaderToolsPreviewActivity" android:exported="true" />
         <activity android:name=".ReaderLoadingTestActivity" android:exported="false" />
