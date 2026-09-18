@@ -10,6 +10,7 @@ import java.io.File
 internal interface AnnotationBackend {
     fun openJournal(): AnnotationJournal
     fun sync(folder: Uri, snapshot: DurableInk, allowLoad: Boolean): SidecarResult
+    fun afterAcknowledged(folder: Uri, snapshot: DurableInk) {}
 }
 
 internal class SafAnnotationBackend(private val context: Context, private val uri: Uri) : AnnotationBackend {
@@ -22,6 +23,7 @@ internal class SafAnnotationBackend(private val context: Context, private val ur
         return AnnotationJournal(journalFile, identity, pruneOnOpen = true)
     }
     override fun sync(folder: Uri, snapshot: DurableInk, allowLoad: Boolean) = sidecar.sync(folder, snapshot, allowLoad)
+    override fun afterAcknowledged(folder: Uri, snapshot: DurableInk) = sidecar.afterAcknowledged(folder, snapshot)
 }
 
 internal fun inkDigest(bytes: ByteArray): String = MessageDigest.getInstance("SHA-256").digest(bytes)
@@ -37,14 +39,25 @@ internal fun pdfDigest(context: Context, target: Uri): String {
 }
 
 internal data class SidecarResult(val hash: String, val imported: List<InkStroke>? = null,
-    val progress: ReadingProgress? = null, val acknowledgedRevision: Long? = null, val audio: List<AudioNote> = emptyList())
+    val progress: ReadingProgress? = null, val acknowledgedRevision: Long? = null, val audio: List<AudioNote> = emptyList(), val needsUpgrade: Boolean = false)
 
 /** Only the external-sync thread accesses this object. No access to mutable local-writer state. */
 internal class AnnotationSidecar(private val context: Context, private val uri: Uri, private val identity: String,
     private val blobs: File = File(context.filesDir, "sidecar-imports/$identity")) {
     private val audioAssets = AudioAssets(context)
     private var validatedFolder: Uri? = null
+    private var lastTransaction: SidecarTransaction? = null
+    private var transactionFolder: Uri? = null
+    private var canonicalName: String? = null
     private var validatedPdfStamp: String? = null
+    fun afterAcknowledged(folder: Uri, snapshot: DurableInk) {
+        if (transactionFolder != folder) return
+        lastTransaction?.recover(snapshot.base, snapshot.revision, snapshot.syncedRevision)
+        val name = canonicalName ?: return
+        val files = SafSidecarFiles(context, folder)
+        if (!snapshot.dirty && files.open(name)?.use(::streamInkDigest) == snapshot.base &&
+            files.open(name)?.use(SidecarBundle::isBundle) == true) audioAssets.retireLegacyAttachments(folder, snapshot.audio)
+    }
     fun sync(folder: Uri, snapshot: DurableInk, allowLoad: Boolean): SidecarResult {
         val resolver = context.contentResolver
         val name = resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use {
@@ -69,29 +82,38 @@ internal class AnnotationSidecar(private val context: Context, private val uri: 
         val transactionDir = File(context.filesDir, "sidecar-transactions").apply { check(exists() || mkdirs()) }
         val key = inkDigest("$uri|$folder|$identity".toByteArray())
         val transaction = SidecarTransaction(files, AtomicSidecarTransactionLog(File(transactionDir, "$key.json")), sideName)
+        lastTransaction = transaction; transactionFolder = folder; canonicalName = sideName
         transaction.recover(snapshot.base, snapshot.revision, snapshot.syncedRevision)?.let {
             return SidecarResult(it.hash, acknowledgedRevision = it.revision)
         }
         val remoteHash = files.open(sideName)?.use(::streamInkDigest)
         if (shouldLoadRemote(snapshot.base, remoteHash, !snapshot.canImportRemote)) {
             require(allowLoad) { "旁文件已变化，请通过菜单重试同步以载入" }
+            val bundled = files.open(sideName)!!.use(SidecarBundle::isBundle)
             val document = files.open(sideName)!!.use { input ->
                 val digest = java.security.MessageDigest.getInstance("SHA-256")
-                val decoded = android.util.JsonReader(java.security.DigestInputStream(input, digest).reader().buffered()).use { reader ->
-                    StreamingInk.read(reader, identity, blobs).also { require(reader.peek() == android.util.JsonToken.END_DOCUMENT) }
-                }
-                require(digest.digest().joinToString("") { "%02x".format(it) } == remoteHash) { "旁文件在载入期间发生变化，请重试" }
+                val stream = java.security.DigestInputStream(input, digest)
+                val decoded = if (bundled) SidecarBundle.read(stream, identity, blobs, audioAssets)
+                    else android.util.JsonReader(stream.reader().buffered()).use { reader ->
+                        StreamingInk.read(reader, identity, blobs).also { require(reader.peek() == android.util.JsonToken.END_DOCUMENT) }
+                    }
+                require(files.open(sideName)!!.use(::streamInkDigest) == remoteHash) { "旁文件在载入期间发生变化，请重试" }
                 decoded
             }
-            audioAssets.download(folder, document.audio)
-            return SidecarResult(remoteHash!!, document.strokes, document.progress, audio = document.audio)
+            if (!bundled) audioAssets.download(folder, document.audio)
+            return SidecarResult(remoteHash!!, document.strokes, document.progress, audio = document.audio, needsUpgrade = !bundled)
         }
-        if (!snapshot.dirty && remoteHash != null) { audioAssets.download(folder, snapshot.audio); return SidecarResult(remoteHash!!) }
-        audioAssets.upload(folder, snapshot.audio)
+        val bundled = remoteHash != null && files.open(sideName)!!.use(SidecarBundle::isBundle)
+        if (bundled && !audioAssets.hasVerified(snapshot.audio)) {
+            files.open(sideName)!!.use { SidecarBundle.read(it, identity, blobs, audioAssets) }
+            require(files.open(sideName)!!.use(::streamInkDigest) == remoteHash) { "旁文件在读取期间发生变化" }
+        } else if (!bundled) audioAssets.download(folder, snapshot.audio)
+        if (!snapshot.dirty && bundled) return SidecarResult(remoteHash!!)
+
         val content = File.createTempFile("ink-sync-", ".json", context.cacheDir)
         return try {
             InkPerformance.measure("sidecar_encode") {
-                content.bufferedWriter().use { StreamingInk.write(it, identity, snapshot.strokes, snapshot.progress ?: ReadingProgress(), snapshot.audio) }
+                content.outputStream().use { SidecarBundle.write(it, identity, InkDocument(snapshot.strokes, snapshot.progress ?: ReadingProgress(), snapshot.audio), audioAssets) }
             }
             SidecarResult(transaction.write(remoteHash, content, snapshot.revision))
         }

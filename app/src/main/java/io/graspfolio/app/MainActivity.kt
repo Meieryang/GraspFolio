@@ -24,6 +24,9 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.dialog
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -35,6 +38,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.material3.LinearProgressIndicator
 import kotlinx.coroutines.ensureActive
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.WindowInsets
@@ -174,8 +178,25 @@ internal fun PdfReader(uri: Uri, onOpenAnother: () -> Unit, onExit: () -> Unit, 
     var restoredDocument by remember(uri) { mutableStateOf<PdfDocument?>(null) }
     var page by remember(uri) { mutableIntStateOf(savedProgress.page) }
     var rendered by remember(uri) { mutableStateOf<RenderedPages?>(null) }
-    val audioPages = document?.let { readingPages(page, it.pageCount, spread, cover).filterNotNull() } ?: emptyList()
-    val audioUi = readerAudioUi(annotations, audioPages, menu)
+    var textSelectionEnabled by rememberSaveable(uri.toString()) { mutableStateOf(false) }
+    var selectedTextMenu by remember { mutableStateOf<SelectedPdfText?>(null) }
+    var insertAfter by remember { mutableStateOf<Int?>(null) }
+    val selectionScope = androidx.compose.runtime.rememberCoroutineScope()
+    val textController = remember(document, textSelectionEnabled) {
+        if (!textSelectionEnabled) null else PdfTextSelection(selectionScope,
+            select = { index, start, end -> withContext(Dispatchers.IO) { document?.selectText(index, start, end) } },
+            menu = { selectedTextMenu = it },
+            error = { android.widget.Toast.makeText(context, it, android.widget.Toast.LENGTH_SHORT).show() })
+    }
+    DisposableEffect(textController) { onDispose { textController?.clear() } }
+    val layout = annotations.progress ?: savedProgress
+    val layoutResult = remember(document, layout.blanks) { runCatching { document?.let { layout.order(it.pageCount) }.orEmpty() } }
+    val pageOrder = layoutResult.getOrDefault(emptyList())
+    LaunchedEffect(layoutResult) { layoutResult.exceptionOrNull()?.let { error = "页面结构损坏：${it.message}" } }
+    val readingCount = pageOrder.size
+    fun readingState() = layout.copy(page = page, cover = cover)
+    val audioPages = if (readingCount > 0) readingPages(page, readingCount, spread, cover).filterNotNull().map { pageOrder[it] } else emptyList()
+    val audioUi = readerAudioUi(annotations, audioPages, menu) { pageOrder.indexOf(it) + 1 }
     val bitmap = rendered?.bitmap
     var renderWidth by remember { mutableIntStateOf(0) }
     var holdPosition by remember { mutableStateOf<Offset?>(null) }
@@ -205,18 +226,19 @@ internal fun PdfReader(uri: Uri, onOpenAnother: () -> Unit, onExit: () -> Unit, 
     LaunchedEffect(annotations.ready, annotations.progress, document) {
         if (annotations.ready) document?.let { active ->
             val restored = annotations.progress ?: savedProgress
-            page = restored.page.coerceIn(0, active.pageCount - 1)
+            val order = runCatching { restored.order(active.pageCount) }.getOrElse { error = "页面结构损坏：${it.message}"; return@let }
+            page = restored.page.coerceIn(0, order.lastIndex)
             cover = restored.cover
             restoredDocument = active
         }
     }
-    LaunchedEffect(document, page, renderWidth, spread, cover, annotations.ready, restoredDocument) {
-        document?.takeIf { renderWidth > 0 && annotations.ready && restoredDocument === it }?.let { active ->
-            val pages = readingPages(page, active.pageCount, spread, cover)
+    LaunchedEffect(document, page, renderWidth, spread, cover, annotations.ready, restoredDocument, pageOrder) {
+        document?.takeIf { renderWidth > 0 && readingCount > 0 && annotations.ready && restoredDocument === it }?.let { active ->
+            val pages = readingPages(page, readingCount, spread, cover).map { it?.let(pageOrder::get) }
             var candidate: RenderedPages? = null
             try {
                 val started = System.nanoTime()
-                withContext(Dispatchers.Default) { candidate = active.render(pages, renderWidth) }
+                withContext(Dispatchers.Default) { candidate = active.render(pages, renderWidth, layout.blanks) }
                 coroutineContext.ensureActive()
                 // Publish PDF placements and the already-resident ink in the same UI turn.
                 annotations.showPages(pages.filterNotNull().toSet())
@@ -243,8 +265,8 @@ internal fun PdfReader(uri: Uri, onOpenAnother: () -> Unit, onExit: () -> Unit, 
     }
     val navigate: (Int) -> Unit = { direction ->
         document?.takeIf { annotations.ready }?.let { active ->
-            page = turnPage(page, active.pageCount, spread, cover, direction)
-            annotations.saveProgress(ReadingProgress(page, cover))
+            page = turnPage(page, readingCount, spread, cover, direction)
+            annotations.saveProgress(readingState())
         }
     }
     // Hidden system bars occupy no layout space. Only physical cutouts and a system-owned
@@ -263,7 +285,8 @@ internal fun PdfReader(uri: Uri, onOpenAnother: () -> Unit, onExit: () -> Unit, 
                 val density = LocalDensity.current
                 val viewport = with(density) { Size(maxWidth.toPx(), maxHeight.toPx()) }
                 val pageBounds = bitmap?.let { fittedPageBounds(viewport, Size(it.width.toFloat(), it.height.toFloat())) } ?: Rect.Zero
-                val currentPages = readingPages(page, document!!.pageCount, spread, cover)
+                val logicalPages = readingPages(page, readingCount, spread, cover)
+                val currentPages = logicalPages.map { it?.let(pageOrder::get) }
                 val renderReady = rendered?.indices == currentPages && rendered?.targetWidth == renderWidth
                 val inkPages = rendered?.let { result ->
                     val fit = pageBounds.width / result.bitmap.width
@@ -281,7 +304,7 @@ internal fun PdfReader(uri: Uri, onOpenAnother: () -> Unit, onExit: () -> Unit, 
                     onContinuousEnd = { holdOrigin = null; holdPosition = null; holdDirection = 0 }
                 )) {
                 Box(Modifier.fillMaxSize().glassSource().background(Paper)) {
-                    bitmap?.let { Image(it.asImageBitmap(), "PDF 第 ${(rendered?.indices?.filterNotNull()?.firstOrNull() ?: page) + 1} 页", Modifier.fillMaxSize(), contentScale = ContentScale.Fit) }
+                    bitmap?.let { Image(it.asImageBitmap(), "阅读第 ${pageOrder.indexOf(rendered?.indices?.filterNotNull()?.firstOrNull()) + 1} 页", Modifier.fillMaxSize(), contentScale = ContentScale.Fit) }
                 }
                 AndroidView(
                     factory = { StylusInkView(it) },
@@ -289,6 +312,7 @@ internal fun PdfReader(uri: Uri, onOpenAnother: () -> Unit, onExit: () -> Unit, 
                     update = { view ->
                         view.placements = inkPages
                         view.strokes = annotations.strokes
+                        view.textSelection = textController
                         view.lasso = lasso
                         view.eraser = eraser
                         view.brushStyle = brushStyle
@@ -306,8 +330,23 @@ internal fun PdfReader(uri: Uri, onOpenAnother: () -> Unit, onExit: () -> Unit, 
                         view.onToggle = { lasso = false; eraser = !eraser }
                     }
                 )
-                val label = rendered!!.indices.filterNotNull().joinToString("–") { (it + 1).toString() }
-                if (!menu) PageNumber(label, document!!.pageCount, Modifier.align(Alignment.BottomCenter))
+                selectedTextMenu?.let { selection ->
+                    val placement = inkPages.firstOrNull { it.page == selection.page }
+                    val bounds = selection.bounds.firstOrNull()
+                    if (placement != null && bounds != null) {
+                        val px = (placement.left + bounds.left * placement.scale).toInt().coerceIn(0, (viewport.width - 260 * density.density).toInt().coerceAtLeast(0))
+                        val py = (placement.top + bounds.top * placement.scale - 56 * density.density).toInt().coerceAtLeast(0)
+                        androidx.compose.foundation.layout.Row(Modifier.align(Alignment.TopStart).offset { androidx.compose.ui.unit.IntOffset(px, py) }.liquidGlass(20).padding(6.dp)) {
+                            androidx.compose.material3.TextButton(onClick = { copyPdfText(context, selection.text); selectedTextMenu = null }) { Text("复制") }
+                            androidx.compose.material3.TextButton(onClick = {
+                                selectedTextMenu = null
+                                if (!translatePdfText(context, selection.text)) android.widget.Toast.makeText(context, "此设备没有可用的 vivo 翻译服务", android.widget.Toast.LENGTH_SHORT).show()
+                            }) { Text("翻译") }
+                        }
+                    }
+                }
+                val label = rendered!!.indices.filterNotNull().joinToString("–") { (pageOrder.indexOf(it) + 1).toString() }
+                if (!menu) PageNumber(label, readingCount, Modifier.align(Alignment.BottomCenter))
                 holdOrigin?.let { origin ->
                     ContinuousTurnIndicator(origin, holdPosition ?: origin, holdDirection)
                 }
@@ -319,15 +358,21 @@ internal fun PdfReader(uri: Uri, onOpenAnother: () -> Unit, onExit: () -> Unit, 
         }
         if (!opening && error == null && chrome != ReaderChrome.READING) key(menu) { ReaderTools(
             immersiveBar = !menu,
+            onInsertBlank = { if (annotations.ready && readingCount > 0) insertAfter = readingPages(page, readingCount, spread, cover).filterNotNull().last() },
+            textSelectionEnabled = textSelectionEnabled,
+            onTextSelection = {
+                if (Build.VERSION.SDK_INT >= 35) textSelectionEnabled = !textSelectionEnabled
+                else android.widget.Toast.makeText(context, "文字选择需要 Android 15 或更新版本", android.widget.Toast.LENGTH_SHORT).show()
+            },
             audioUi = if (menu) audioUi else null,
             brushColor = { penSettings.loadBrush(it).opaqueColor },
             lasso = lasso, onLasso = { lasso = true; eraser = false },
             dismissBrushRequest = pageContactSequence,
             style = brushStyle, eraser = eraser, onStyle = selectStyle,
             onBrush = { selectStyle(penSettings.loadBrush(it)) }, onEraser = { lasso = false; eraser = it }, onClose = { chrome = if (menu) ReaderChrome.WRITING else ReaderChrome.READING },
-            page = page, pageCount = document?.pageCount ?: 0,
-            onPage = { target -> document?.takeIf { annotations.ready }?.let { doc -> page = readingPages(target, doc.pageCount, spread, cover).filterNotNull().first(); annotations.saveProgress(ReadingProgress(page, cover)) } },
-            spread = spread, cover = cover, onCover = { if (annotations.ready) { cover = !cover; annotations.saveProgress(ReadingProgress(page, cover)) } },
+            page = page, pageCount = readingCount,
+            onPage = { target -> document?.takeIf { annotations.ready }?.let { doc -> page = readingPages(target, readingCount, spread, cover).filterNotNull().first(); annotations.saveProgress(readingState()) } },
+            spread = spread, cover = cover, onCover = { if (annotations.ready) { cover = !cover; annotations.saveProgress(readingState()) } },
             writingVibration = writingVibration, onVibration = { writingVibration = !writingVibration; penSettings.edit().putBoolean("writing_vibration", writingVibration).apply() },
             predictionMode = PredictionMode.fromKey(predictionModeKey), onPredictionMode = { predictionModeKey = it.key; penSettings.edit().putString("prediction_mode", it.key).apply() },
             prediction = predictionEnabled, onPrediction = { predictionEnabled = !predictionEnabled; penSettings.edit().putBoolean("prediction", predictionEnabled).apply() },
@@ -335,6 +380,33 @@ internal fun PdfReader(uri: Uri, onOpenAnother: () -> Unit, onExit: () -> Unit, 
             diagnostics = penDiagnostics, saveStatus = annotations.status, onAuthorize = { folderPicker.launch(null) }, onRetry = annotations::retry, onExit = onExit
         ) }
         if (!opening && error == null && !menu) ImmersiveAudio(audioUi, chrome == ReaderChrome.WRITING)
+        insertAfter?.let { after ->
+            BackHandler { insertAfter = null }
+            // Keep glass sampling in the reader window's coordinate space.
+            Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = .32f))
+                .pointerInput(Unit) { detectTapGestures { insertAfter = null } }, contentAlignment = Alignment.Center) {
+                Column(Modifier.width(360.dp).liquidGlass(28)
+                    .semantics { dialog() }
+                    .pointerInput(Unit) { detectTapGestures { } }.padding(24.dp)) {
+                    Text("插入空白页", style = MaterialTheme.typography.titleLarge, color = Ink)
+                    Spacer(Modifier.height(16.dp))
+                    Text("在第 ${after + 1} 页后插入一张空白页？空白页与批注保存在旁文件中，原 PDF 保持不变。", color = Ink)
+                    Spacer(Modifier.height(20.dp))
+                    androidx.compose.foundation.layout.Row(horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(16.dp)) {
+                        androidx.compose.material3.TextButton(onClick = { insertAfter = null }) { Text("取消") }
+                        androidx.compose.material3.TextButton(onClick = {
+                            document?.takeIf { annotations.ready }?.let { doc ->
+                                val next = readingState().insertAfter(after, doc.pageCount)
+                                textController?.clear()
+                                annotations.saveProgress(next)
+                                page = next.page
+                            }
+                            insertAfter = null
+                        }) { Text("确认插入") }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -517,8 +589,13 @@ private class PdfDocument(context: Context, uri: Uri) : AutoCloseable {
         pageSizes = result
     }
     @Synchronized
-    fun render(indices: List<Int?>, targetWidth: Int): RenderedPages {
-        val dimensions = indices.map { index -> index?.let { pageSizes[it] } }
+    fun render(indices: List<Int?>, targetWidth: Int, blanks: List<BlankPage> = emptyList()): RenderedPages {
+        val allSizes = pageSizes.toMutableList()
+        blanks.forEach { blank ->
+            require(blank.id == allSizes.size && blank.after in allSizes.indices)
+            allSizes += allSizes[blank.after]
+        }
+        val dimensions = indices.map { index -> index?.let { allSizes[it] } }
         val fallback = dimensions.first { it != null }!!
         val sizes = dimensions.map { it ?: fallback }
         val totalWidth = sizes.sumOf { it.width.toDouble() }.toFloat()
@@ -533,8 +610,8 @@ private class PdfDocument(context: Context, uri: Uri) : AutoCloseable {
         try {
             indices.forEachIndexed { slot, index ->
                 val width = sizes[slot].width * scale
-                if (index != null) renderer.openPage(index).use { p ->
-                    placements += PagePlacement(index, x, 0f, p.width.toFloat(), p.height.toFloat(), scale)
+                if (index != null) placements += PagePlacement(index, x, 0f, sizes[slot].width, sizes[slot].height, scale)
+                if (index != null && index < pageCount) renderer.openPage(index).use { p ->
                     val matrix = Matrix().apply { setScale(scale, scale); postTranslate(x, 0f) }
                     val clip = AndroidRect(x.roundToInt(), 0, (x + width).roundToInt().coerceAtMost(bitmap.width), (sizes[slot].height * scale).roundToInt().coerceAtMost(bitmap.height))
                     if (clip.width() > 0 && clip.height() > 0) p.render(bitmap, clip, matrix, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
@@ -543,6 +620,16 @@ private class PdfDocument(context: Context, uri: Uri) : AutoCloseable {
             }
             return RenderedPages(bitmap, placements, indices, targetWidth)
         } catch (failure: Exception) { bitmap.recycle(); throw failure }
+    }
+    @Synchronized
+    fun selectText(index: Int, start: android.graphics.Point, end: android.graphics.Point): SelectedPdfText? {
+        if (Build.VERSION.SDK_INT < 35 || index !in 0 until pageCount) return null
+        return renderer.openPage(index).use { pdf ->
+            val selection = pdf.selectContent(android.graphics.pdf.models.selection.SelectionBoundary(start), android.graphics.pdf.models.selection.SelectionBoundary(end)) ?: return@use null
+            val contents = selection.selectedTextContents
+            val text = contents.joinToString("\n") { it.text }
+            if (text.isBlank()) null else SelectedPdfText(index, text, contents.flatMap { it.bounds }.map { android.graphics.RectF(it) })
+        }
     }
     @Synchronized
     override fun close() { renderer.close(); descriptor.close() }

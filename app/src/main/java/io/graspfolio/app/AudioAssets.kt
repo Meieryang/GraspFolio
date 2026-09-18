@@ -55,6 +55,46 @@ internal class AudioAssets(private val context: Context) {
         // Atomic rename inside the private directory. The imported bytes are fsynced first.
         check(temporary.renameTo(target)) { "无法保存音频副本" }
     }
+    fun writeEmbedded(note: AudioNote, output: OutputStream) {
+        val source = file(note)
+        require(source.exists() && source.length() == note.bytes) { "缺少本地音频：${note.name}" }
+        val result = source.inputStream().use { copy(it, output) }
+        require(result.first == note.hash && result.second == note.bytes) { "本地音频损坏：${note.name}" }
+    }
+    fun readEmbedded(note: AudioNote, input: InputStream) {
+        val temporary = File(directory, ".embedded-${UUID.randomUUID()}")
+        try {
+            val result = FileOutputStream(temporary).use { output -> copy(input, output).also { output.fd.sync() } }
+            require(result.first == note.hash && result.second == note.bytes) { "内嵌音频损坏：${note.name}" }
+            commit(temporary, note)
+        } finally { temporary.delete() }
+    }
+    fun hasVerified(notes: List<AudioNote>) = notes.distinctBy { it.hash }.all {
+        val source = file(it)
+        source.exists() && source.length() == it.bytes && digest(source) == it.hash
+    }
+    /** Only retire known audio after every canonical sidecar in this folder is self-contained. */
+    fun retireLegacyAttachments(folder: Uri, notes: List<AudioNote>) {
+        if (notes.isEmpty()) return
+        var canRetire = true
+        resolver.query(DC.buildChildDocumentsUriUsingTree(folder, DC.getTreeDocumentId(folder)),
+            arrayOf(DC.Document.COLUMN_DOCUMENT_ID, DC.Document.COLUMN_DISPLAY_NAME), null, null, null)?.use { c ->
+            while (c.moveToNext()) {
+                if (!c.getString(1).endsWith(".graspfolio")) continue
+                val uri = DC.buildDocumentUriUsingTree(folder, c.getString(0))
+                if (resolver.openInputStream(uri)?.use(SidecarBundle::isBundle) != true) canRetire = false
+            }
+        } ?: return
+        if (!canRetire) return
+        val existing = children(folder)
+        notes.distinctBy { it.hash }.forEach { note ->
+            val remote = existing[assetName(note)] ?: return@forEach
+            // Private content-addressed bytes remain as recovery and playback cache.
+            require(hasVerified(listOf(note))) { "音频本地恢复副本不可用，保留旧附件" }
+            verify(remote, note)
+            check(DC.deleteDocument(resolver, remote.uri)) { "旧音频附件暂未清理" }
+        }
+    }
     private fun assetName(note: AudioNote) = "graspfolio-audio-${note.hash}.audio"
     private data class Remote(val uri: Uri, val size: Long, val modified: Long)
     private fun children(folder: Uri): Map<String, Remote> {

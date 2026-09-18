@@ -6,6 +6,7 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <!-- SDK 1.0.0.10 no longer requests QUERY_ALL_PACKAGES; keep visibility scoped. -->
     <queries>
+        <intent><action android:name="android.intent.action.PROCESS_TEXT" /><data android:mimeType="text/plain" /></intent>
         <package android:name="com.vivo.penalgoengine" />
         <package android:name="com.vivo.penwrite" />
     </queries>

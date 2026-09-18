@@ -12,7 +12,7 @@ internal data class DurableInk(
 ) {
     val dirty get() = revision != syncedRevision
     // Only a fresh, never-edited local document may import despite unsynced reading progress.
-    val canImportRemote get() = !dirty || (base == null && contentRevision == 0L && strokes.isEmpty() && audio.isEmpty())
+    val canImportRemote get() = !dirty || (base == null && contentRevision == 0L && strokes.isEmpty() && audio.isEmpty() && progress?.blanks.isNullOrEmpty())
     fun acknowledged(revision: Long, hash: String): DurableInk {
         require(revision in syncedRevision..this.revision)
         return copy(base = hash, syncedRevision = revision)
@@ -101,7 +101,7 @@ internal class AnnotationJournal(private val file: File, private val identity: S
         require(progress == null || progress.page >= 0)
         val current = state.strokes as PagedInk
         if (strokes === current) return append(state.copy(progress = progress, audio = audio, revision = state.revision + 1,
-            contentRevision = if (audio != state.audio) state.revision + 1 else state.contentRevision), emptyList(), emptyList())
+            contentRevision = if (audio != state.audio || progress?.blanks.orEmpty() != state.progress?.blanks.orEmpty()) state.revision + 1 else state.contentRevision), emptyList(), emptyList())
         require(pages == null || strokes.all { it.page in pages })
         val oldRefs = current.refs.filter { pages == null || it.page in pages }.let { if (pages == null) it else it.sortedBy { ref -> ref.page } }
         val old = oldRefs.associateBy { it.id }
@@ -124,7 +124,7 @@ internal class AnnotationJournal(private val file: File, private val identity: S
             pages.forEach { validateOrder(incoming[it].orEmpty(), previous[it].orEmpty()) }
         }
         return append(state.copy(strokes = current.changed(added, removed), progress = progress, audio = audio, revision = state.revision + 1,
-            contentRevision = if (added.isNotEmpty() || removed.isNotEmpty() || audio != state.audio) state.revision + 1 else state.contentRevision), added, removed).also { resident = strokes }
+            contentRevision = if (added.isNotEmpty() || removed.isNotEmpty() || audio != state.audio || progress?.blanks.orEmpty() != state.progress?.blanks.orEmpty()) state.revision + 1 else state.contentRevision), added, removed).also { resident = strokes }
     }
     fun acknowledge(revision: Long, hash: String): Int = append(state.acknowledged(revision, hash), emptyList(), emptyList())
     private fun append(next: DurableInk, added: List<InkStroke>, removed: List<String>): Int {

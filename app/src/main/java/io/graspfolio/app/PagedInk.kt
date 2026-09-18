@@ -99,9 +99,9 @@ internal object StreamingInk {
         return header.copy(strokes = PagedInk(directory, identity, refs))
     }
     fun write(out: Writer, identity: String, strokes: List<InkStroke>, progress: ReadingProgress?, audio: List<AudioNote>) {
-        val header = JSONObject().put("version", if (audio.isEmpty()) 2 else 3).put("document", identity)
+        val header = JSONObject().put("version", if (!progress?.blanks.isNullOrEmpty()) 4 else if (audio.isEmpty()) 2 else 3).put("document", identity)
             .put("reading", progress?.toJson() ?: JSONObject.NULL)
-        if (audio.isNotEmpty()) header.put("audio", audioJson(audio))
+        if (audio.isNotEmpty() || !progress?.blanks.isNullOrEmpty()) header.put("audio", audioJson(audio))
         out.write(header.toString().dropLast(1)); out.write(",\"strokes\":[")
         strokes.forEachIndexed { i, stroke ->
             if (i > 0) out.write(",")

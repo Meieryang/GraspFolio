@@ -38,7 +38,7 @@ internal data class ReaderAudioUi(val entries: @Composable (Dp) -> Unit, val con
     val hasNotes: Boolean, val interactionVersion: Int, val collapse: () -> Unit)
 
 @Composable
-internal fun readerAudioUi(store: AnnotationStore, pages: List<Int>, menu: Boolean): ReaderAudioUi {
+internal fun readerAudioUi(store: AnnotationStore, pages: List<Int>, menu: Boolean, displayPage: (Int) -> Int = { it + 1 }): ReaderAudioUi {
     val context = LocalContext.current
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     val player = remember(store) { PageAudioPlayer(context) }
@@ -108,7 +108,7 @@ internal fun readerAudioUi(store: AnnotationStore, pages: List<Int>, menu: Boole
         Box {
             AudioEntries(notes, player.selected?.id, player.playing, menu, !busy && !recorder.recording && !recorder.saving && store.ready && pages.isNotEmpty(), width,
                 onImport = { interactionVersion++; addChoices = !addChoices },
-                onSelect = { interactionVersion++; addChoices = false; player.select(it) }, canPlay = !recorder.recording)
+                onSelect = { interactionVersion++; addChoices = false; player.select(it) }, canPlay = !recorder.recording, displayPage = displayPage)
             if (addChoices || choosePage) {
                 val offset = with(androidx.compose.ui.platform.LocalDensity.current) { androidx.compose.ui.unit.IntOffset(0, 48.dp.roundToPx()) }
                 androidx.compose.ui.window.Popup(alignment = Alignment.TopStart, offset = offset,
@@ -117,7 +117,7 @@ internal fun readerAudioUi(store: AnnotationStore, pages: List<Int>, menu: Boole
                     Column(Modifier.width(168.dp).liquidGlass(18, .85f).padding(6.dp)) {
                         if (choosePage) pages.forEach { page ->
                             TextButton({ choosePage = false; startAt(page) }, Modifier.fillMaxWidth().height(38.dp)) {
-                                Text("插入第 ${page + 1} 页", color = GlassInk, fontSize = 13.sp)
+                                Text("插入第 ${displayPage(page)} 页", color = GlassInk, fontSize = 13.sp)
                             }
                         } else {
                             TextButton({ chooseAction(false) }, Modifier.fillMaxWidth().height(38.dp)) { Text("导入音频", color = GlassInk, fontSize = 13.sp) }
@@ -132,7 +132,7 @@ internal fun readerAudioUi(store: AnnotationStore, pages: List<Int>, menu: Boole
             Row(Modifier.widthIn(max = 400.dp).fillMaxWidth().liquidGlass(24, .5f).padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
                 if (recorder.recording) {
                     Text("●", color = androidx.compose.ui.graphics.Color(0xffc57968), modifier = Modifier.padding(8.dp))
-                    Text("第 ${recorder.page + 1} 页 · 录音 ${audioTime(recorder.elapsedMs)}", color = GlassInk, modifier = Modifier.weight(1f), fontSize = 13.sp)
+                    Text("第 ${displayPage(recorder.page)} 页 · 录音 ${audioTime(recorder.elapsedMs)}", color = GlassInk, modifier = Modifier.weight(1f), fontSize = 13.sp)
                     AudioIconButton("stop", "结束录音并保存", glass = false, onClick = recorder::stopAndSave)
                 } else {
                     Text(if (recorder.saving) "正在保存录音…" else recorder.error.orEmpty(), color = GlassInk, modifier = Modifier.weight(1f), fontSize = 12.sp)
@@ -150,7 +150,7 @@ internal fun readerAudioUi(store: AnnotationStore, pages: List<Int>, menu: Boole
         } else if (player.expanded) player.selected?.let { note ->
             AudioPlaybackControls(note, player.playing, player.preparing, player.position, player.duration, player.error,
                 onToggle = player::toggle, onSeek = player::seek, onClose = { player.expanded = false },
-                onRemove = if (menu) ({ deleteNote = note }) else null)
+                onRemove = if (menu) ({ deleteNote = note }) else null, displayPage = displayPage)
         }
     }, hasNotes = notes.isNotEmpty() || message != null || busy || recorder.recording || recorder.saving || recorder.error != null, interactionVersion = interactionVersion,
         collapse = { player.expanded = false; addChoices = false; choosePage = false })
@@ -158,11 +158,11 @@ internal fun readerAudioUi(store: AnnotationStore, pages: List<Int>, menu: Boole
 
 @Composable
 internal fun AudioEntries(notes: List<AudioNote>, selectedId: String?, playing: Boolean, showImport: Boolean,
-    canImport: Boolean, width: Dp, onImport: () -> Unit, onSelect: (AudioNote) -> Unit, canPlay: Boolean = true) {
+    canImport: Boolean, width: Dp, onImport: () -> Unit, onSelect: (AudioNote) -> Unit, canPlay: Boolean = true, displayPage: (Int) -> Int = { it + 1 }) {
     Row(Modifier.widthIn(max = width).horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         if (showImport) AudioIconButton("import", "插入音频", enabled = canImport, onClick = onImport)
         notes.forEach { note -> key(note.id) {
-            AudioIconButton("wave", "播放音频：${note.name}，第 ${note.page + 1} 页", selected = note.id == selectedId,
+            AudioIconButton("wave", "播放音频：${note.name}，第 ${displayPage(note.page)} 页", selected = note.id == selectedId,
                 onClick = { onSelect(note) }, enabled = canPlay, playing = playing && note.id == selectedId)
         } }
     }
@@ -170,7 +170,7 @@ internal fun AudioEntries(notes: List<AudioNote>, selectedId: String?, playing: 
 
 @Composable
 internal fun AudioPlaybackControls(note: AudioNote, playing: Boolean, preparing: Boolean, position: Int, duration: Int,
-    error: String?, onToggle: () -> Unit, onSeek: (Int) -> Unit, onClose: () -> Unit, onRemove: (() -> Unit)? = null) {
+    error: String?, onToggle: () -> Unit, onSeek: (Int) -> Unit, onClose: () -> Unit, onRemove: (() -> Unit)? = null, displayPage: (Int) -> Int = { it + 1 }) {
     Column(Modifier.widthIn(max = 400.dp).fillMaxWidth().liquidGlass(24, .42f).padding(horizontal = 8.dp, vertical = 4.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             if (preparing) Box(Modifier.size(40.dp), contentAlignment = Alignment.Center) {
@@ -186,7 +186,7 @@ internal fun AudioPlaybackControls(note: AudioNote, playing: Boolean, preparing:
             AudioIconButton("collapse", "收起音频控制", glass = false, onClick = onClose)
         }
         Row(Modifier.padding(start = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-            Text(error ?: "第 ${note.page + 1} 页 · ${note.name}", color = GlassMuted, fontSize = 11.sp,
+            Text(error ?: "第 ${displayPage(note.page)} 页 · ${note.name}", color = GlassMuted, fontSize = 11.sp,
                 maxLines = if (error != null) 2 else 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
             if (onRemove != null) AudioIconButton("delete", "移除音频笔记", glass = false, onClick = onRemove)
         }

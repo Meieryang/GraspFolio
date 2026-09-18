@@ -65,7 +65,7 @@ internal class StylusInkView(context: Context) : FrameLayout(context), DefaultLi
         set(value) { if (field != value) { cancelStroke(); resetFront(); field = value; report() } }
     private fun resetFront() { if (Build.VERSION.SDK_INT >= 29) front?.reset() }
     var placements: List<PagePlacement> = emptyList()
-        set(value) { if (field != value) { cancelStroke(); clearLassoPreview(); selection.clear(); resetFront(); field = value; invalidate() } }
+        set(value) { if (field != value) { cancelStroke(); clearLassoPreview(); selection.clear(); resetFront(); field = value; textSelection?.attach(this, value); invalidate() } }
     var strokes: List<InkStroke> = emptyList()
         set(value) { if (field !== value) { stopLassoWork(); clearLassoPreview(); selection.clear(); field = value; invalidate() } }
     private val selection = LassoSelection()
@@ -83,6 +83,8 @@ internal class StylusInkView(context: Context) : FrameLayout(context), DefaultLi
     }
     var lasso = false
         set(value) { if (field != value) { cancelStroke(); clearLassoPreview(); selection.clear(); field = value; invalidate() } }
+    var textSelection: PdfTextSelection? = null
+        set(value) { if (field !== value) { field?.clear(); field = value; value?.attach(this, placements); invalidate() } }
     var eraser = false
     var brushStyle = BrushStyle()
     private var activeStyle = BrushStyle()
@@ -156,7 +158,7 @@ internal class StylusInkView(context: Context) : FrameLayout(context), DefaultLi
         cancelStroke(); clearLassoPreview()
         if (Build.VERSION.SDK_INT >= 29) front?.let { it.close(); removeView(it.view) }
         front = null
-        sdk.stop(); committed.release(); live.release(); owner.lifecycle.removeObserver(this); super.onDetachedFromWindow()
+        sdk.stop(); committed.release(); live.release(); owner.lifecycle.removeObserver(this); super.onDetachedFromWindow(); textSelection?.clear()
     }
     override fun onInterceptTouchEvent(event: MotionEvent) = true
     override fun onResume(owner: LifecycleOwner) { foreground = true; sdk.start() }
@@ -175,6 +177,15 @@ internal class StylusInkView(context: Context) : FrameLayout(context), DefaultLi
         sdk.vibrate(false); onContact(false); invalidate()
     }
     override fun onTouchEvent(event: MotionEvent): Boolean {
+        textSelection?.let { selection ->
+            selection.attach(this, placements)
+            if (pointer == -1 && event.getToolType(event.actionIndex) == MotionEvent.TOOL_TYPE_FINGER) {
+                if (event.actionMasked == MotionEvent.ACTION_DOWN) onPageContact()
+                return selection.touch(event)
+            }
+            if (event.getToolType(event.actionIndex) == MotionEvent.TOOL_TYPE_STYLUS) selection.clear()
+        }
+
         doubleTapSwitch.observeStylus(event)
         val actionIndex = event.actionIndex
         if ((event.actionMasked == MotionEvent.ACTION_DOWN || event.actionMasked == MotionEvent.ACTION_POINTER_DOWN) &&
@@ -326,6 +337,7 @@ internal class StylusInkView(context: Context) : FrameLayout(context), DefaultLi
             marker.color = 0xff567896.toInt(); marker.style = Paint.Style.STROKE; marker.strokeWidth = resources.displayMetrics.density
             canvas.drawCircle(x, y, radius, marker)
         } }
+        textSelection?.draw(canvas)
         if (active != null) {
             drawCount++; drawNanos += System.nanoTime() - begin
             maxEventAge = maxOf(maxEventAge, (SystemClock.uptimeMillis() - latestEventTime).coerceAtLeast(0))

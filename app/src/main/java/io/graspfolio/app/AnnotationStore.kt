@@ -20,8 +20,8 @@ internal data class InkDocument(val strokes: List<InkStroke>, val progress: Read
 
 internal object InkCodec {
     fun encodeDocument(identity: String, strokes: List<InkStroke>, progress: ReadingProgress?, audio: List<AudioNote> = emptyList()): String =
-        root(identity, strokes).put("version", if (audio.isEmpty()) 2 else 3).put("reading", progress?.toJson() ?: JSONObject.NULL)
-            .apply { if (audio.isNotEmpty()) put("audio", audioJson(audio)) }.toString()
+        root(identity, strokes).put("version", if (!progress?.blanks.isNullOrEmpty()) 4 else if (audio.isEmpty()) 2 else 3).put("reading", progress?.toJson() ?: JSONObject.NULL)
+            .apply { if (audio.isNotEmpty() || !progress?.blanks.isNullOrEmpty()) put("audio", audioJson(audio)) }.toString()
     fun encode(identity: String, strokes: List<InkStroke>): String = root(identity, strokes).toString()
     private fun root(identity: String, strokes: List<InkStroke>): JSONObject = JSONObject().put("version", 1).put("document", identity)
         .put("strokes", JSONArray().apply { strokes.forEach { s -> put(JSONObject().put("id", s.id).put("page", s.page)
@@ -31,7 +31,7 @@ internal object InkCodec {
     fun decode(text: String, identity: String): List<InkStroke> = decodeDocument(text, identity).strokes
     fun decodeDocument(text: String, identity: String): InkDocument {
         val root = JSONObject(text)
-        require(root.getInt("version") in 1..3 && root.getString("document") == identity) { "批注版本或 PDF 身份不匹配" }
+        require(root.getInt("version") in 1..4 && root.getString("document") == identity) { "批注版本或 PDF 身份不匹配" }
         val reading = if (root.getInt("version") >= 2) { require(root.has("reading")); readProgress(root) } else null
         val items = root.getJSONArray("strokes")
         val result = (0 until items.length()).map { i ->
@@ -335,6 +335,11 @@ internal class AnnotationStore internal constructor(private val context: Context
                         } else {
                             InkPerformance.measure("local_ack") { journal.acknowledge(output.acknowledgedRevision ?: snapshot.revision, output.hash) }
                         }
+                        val acknowledged = journal.state
+                        remoteQueue.execute {
+                            runCatching { backend.afterAcknowledged(folder, acknowledged) }
+                                .onFailure { Log.w("GraspFolioPerf", "Sidecar cleanup deferred", it) }
+                        }
                         if (!localFailed) publish(if (journal.state.dirty) "未同步 · 本地已保存，等待旁文件同步" else "已同步到 PDF 旁")
                         // Compact only occasionally, not once per edit, and never before queued edits.
                         if (pendingWrites.get() == 0) {
@@ -355,7 +360,7 @@ internal class AnnotationStore internal constructor(private val context: Context
                     manualPending = false
                     completeManual()
                 } else if (manualPending) startSync()
-                else if (result.isSuccess && journal.state.dirty && !localFailed) scheduleSync()
+                else if (result.isSuccess && (journal.state.dirty || result.getOrNull()?.needsUpgrade == true) && !localFailed) scheduleSync()
                 // On failure, retry only after another edit or explicit user action.
                 retireIfIdle()
             }

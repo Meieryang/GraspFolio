@@ -58,6 +58,7 @@ internal fun ReaderTools(
     lasso: Boolean = false, onLasso: () -> Unit = {},
     immersiveBar: Boolean = false,
     brushColor: (String) -> Int = { if (it == "highlighter") Swatches[3] else Swatches[0] },
+    onInsertBlank: () -> Unit = {}, textSelectionEnabled: Boolean = false, onTextSelection: () -> Unit = {},
     predictionMode: PredictionMode = PredictionMode.STABLE, onPredictionMode: (PredictionMode) -> Unit = {},
     audioUi: ReaderAudioUi? = null
 ) {
@@ -73,10 +74,10 @@ internal fun ReaderTools(
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val availableWidth = maxWidth
         val compact = maxWidth < 420.dp
-        val audioOnOwnRow = audioUi != null && maxWidth < 700.dp
+        val audioOnOwnRow = audioUi != null && maxWidth < 800.dp
         val audioOffset = if (audioOnOwnRow) 56.dp else 0.dp
         if (audioUi != null) Box(Modifier.align(Alignment.TopStart).padding(top = 16.dp, start = 16.dp, end = 16.dp)) {
-            audioUi.entries(if (audioOnOwnRow) availableWidth - 32.dp else ((availableWidth - 440.dp) / 2 - 24.dp).coerceIn(48.dp, 200.dp))
+            audioUi.entries(if (audioOnOwnRow) availableWidth - 32.dp else ((availableWidth - 540.dp) / 2 - 24.dp).coerceIn(48.dp, 200.dp))
         }
         val panelHeight = minOf(maxHeight * .7f, (maxHeight - 160.dp).coerceAtLeast(96.dp))
         Row(Modifier.align(Alignment.TopCenter).padding(top = if (immersiveBar) 0.dp else 16.dp + audioOffset, start = if (compact) 8.dp else 12.dp, end = if (compact) 8.dp else 12.dp),
@@ -103,6 +104,8 @@ internal fun ReaderTools(
                     }
                 }
             }
+            Box(Modifier.glass()) { ToolButton("insert-page", "向后插入空白页", false, onInsertBlank) }
+            Box(Modifier.glass()) { ToolButton("select-text", "文字选择", textSelectionEnabled, onTextSelection) }
             if (!immersiveBar) {
             Box(Modifier.glass()) { ToolButton("settings", "阅读设置与保存", panel == "settings") { panel = if (panel == "settings") null else "settings" } }
             }
@@ -210,6 +213,16 @@ private fun ToolButton(icon: String, label: String, selected: Boolean, onClick: 
             fun p(x: Float, y: Float) = Offset(x * size.width / 24, y * size.height / 24)
             fun line(x: Float, y: Float, x2: Float, y2: Float) = drawLine(ToolInk, p(x, y), p(x2, y2), 1.7.dp.toPx(), StrokeCap.Round)
             when (icon) {
+                "insert-page" -> {
+                    line(5f, 3f, 15f, 3f); line(15f, 3f, 19f, 7f); line(19f, 7f, 19f, 21f)
+                    line(19f, 21f, 5f, 21f); line(5f, 21f, 5f, 3f)
+                    line(8f, 13f, 16f, 13f); line(12f, 9f, 12f, 17f)
+                }
+                "select-text" -> {
+                    line(7f, 5f, 17f, 5f); line(12f, 5f, 12f, 19f); line(8f, 19f, 16f, 19f)
+                    line(3f, 3f, 5f, 3f); line(3f, 3f, 3f, 8f)
+                    line(21f, 16f, 21f, 21f); line(19f, 21f, 21f, 21f)
+                }
                 "exit" -> {
                     line(12f, 4f, 4f, 4f); line(4f, 4f, 4f, 20f); line(4f, 20f, 12f, 20f)
                     line(12f, 4f, 12f, 8f); line(12f, 16f, 12f, 20f)
